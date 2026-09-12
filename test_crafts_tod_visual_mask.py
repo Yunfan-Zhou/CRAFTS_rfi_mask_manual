@@ -5,7 +5,14 @@ from types import SimpleNamespace
 import matplotlib.pyplot as plt
 import numpy as np
 
-from crafts_tod_visual_mask import CraftsTodMaskEditor, contrast_limits_from_drag
+from crafts_tod_visual_mask import (
+    CraftsTodMaskEditor,
+    _console_page_html,
+    configure_webagg,
+    contrast_limits_from_drag,
+    status_message,
+    web_status_payload,
+)
 
 
 def test_right_drag_adjusts_both_polarization_limits() -> None:
@@ -17,6 +24,53 @@ def test_right_drag_adjusts_both_polarization_limits() -> None:
     widened = contrast_limits_from_drag(start, 0.0, 25.0, 100.0, 100.0)
     assert widened[0][1] - widened[0][0] > 2.0
     assert widened[1][1] - widened[1][0] > 4.0
+
+
+def test_webagg_port_validation() -> None:
+    original_backend = plt.get_backend
+    original_values = {
+        key: plt.rcParams[key]
+        for key in (
+            "webagg.address", "webagg.port", "webagg.port_retries",
+            "webagg.open_in_browser",
+        )
+    }
+    try:
+        plt.get_backend = lambda: "WebAgg"
+        configure_webagg(8991)
+        assert plt.rcParams["webagg.address"] == "127.0.0.1"
+        assert plt.rcParams["webagg.port"] == 8991
+        assert plt.rcParams["webagg.port_retries"] == 1
+        assert not plt.rcParams["webagg.open_in_browser"]
+    finally:
+        plt.get_backend = original_backend
+        plt.rcParams.update(original_values)
+
+
+def test_webagg_rejects_unsafe_port() -> None:
+    with np.testing.assert_raises(ValueError):
+        configure_webagg(80)
+
+
+def test_web_console_contains_live_status_and_mouse_feedback() -> None:
+    html = _console_page_html([1], "")
+    assert "服务器运行状态" in html
+    assert "/status.json" in html
+    assert "mousedown" in html
+    assert "正在拖动选区" in html
+    assert "join('\\n')" in html
+    assert "motion_notify" in html
+    assert "setTimeout(pollStatus, 1500)" in html
+    assert "AbortController" not in html
+
+
+def test_status_payload_records_busy_state_and_log() -> None:
+    status_message("unit-test loading", phase="loading", busy=True)
+    payload = web_status_payload()
+    assert payload["busy"] is True
+    assert payload["phase"] == "loading"
+    assert payload["message"] == "unit-test loading"
+    assert payload["lines"][-1].endswith("unit-test loading")
 
 
 def test_shift_scroll_zooms_both_waterfall_record_axes() -> None:

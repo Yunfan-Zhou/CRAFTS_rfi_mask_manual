@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -18,7 +19,11 @@ FILENAME_RE = re.compile(
     r"(?P<window>[^_]+)_(?P<serial>\d{4})(?P<tail>_.+)\.fits$",
     re.IGNORECASE,
 )
-MASK_FORMAT = "crafts-tod-manual-mask-v1"
+MASK_FORMAT = "crafts-tod-manual-mask-v2"
+BEAM_MASK_SCHEMA_VERSION = "CRAFTS_MANUAL_RFI_MASK_V1"
+AUTHORING_SCOPE_SCHEMA = "global-plus-per-beam-v1"
+EXPECTED_BEAMS = tuple(f"M{index:02d}" for index in range(1, 20))
+AUTO_LAYER_NAMES = ("one_channel", "sat1380")
 
 
 @dataclass(frozen=True)
@@ -41,7 +46,7 @@ class TodGroup:
 
     @property
     def key(self) -> str:
-        return f"{self.scan_name}__{self.serial}"
+        return f"{self.scan_name}__{self.window}__{self.serial}__T"
 
     @property
     def beams(self) -> tuple[str, ...]:
@@ -59,12 +64,23 @@ class PolarizationMask:
 class MaskDocument:
     scan_name: str
     serial: str
-    beam_files: dict[str, str]
+    window: str = "W"
+    stage: str = "T"
+    beam_files: dict[str, str] = field(default_factory=dict)
+    auto_mask_files: dict[str, dict[str, str]] = field(default_factory=dict)
+    auto_mask_roles: dict[str, str] = field(
+        default_factory=lambda: {
+            "one_channel": "science_bad",
+            "sat1380": "science_bad",
+        }
+    )
     polarizations: list[PolarizationMask] = field(
         default_factory=lambda: [PolarizationMask(), PolarizationMask()]
     )
+    beam_polarizations: dict[str, list[PolarizationMask]] = field(default_factory=dict)
     done: bool = False
     format: str = MASK_FORMAT
+    authoring_scope_schema: str = AUTHORING_SCOPE_SCHEMA
     saved_at_utc: str = ""
     frequency_unit: str = "MHz"
     time_unit: str = "record"
@@ -75,8 +91,48 @@ class MaskDocument:
         return cls(
             scan_name=group.scan_name,
             serial=group.serial,
+            window=group.window,
+            stage="T",
             beam_files={item.beam: str(item.path.resolve()) for item in group.files},
+            beam_polarizations={
+                item.beam: [PolarizationMask(), PolarizationMask()]
+                for item in group.files
+            },
         )
+
+
+@dataclass(frozen=True)
+class AutoMaskDirectories:
+    one_channel: Path | None = None
+    sat1380: Path | None = None
+
+
+@dataclass
+class BeamAveragedTod:
+    frequency_mhz: np.ndarray
+    mjd: np.ndarray
+    raw_mean: np.ndarray
+    auto_masked_mean: np.ndarray
+    layer_flagged_beam_count: dict[str, np.ndarray]
+    union_flagged_beam_count: np.ndarray
+    layer_available_beams: dict[str, int]
+    auto_mask_files: dict[str, dict[str, str]]
+    warnings: list[str]
+
+    @property
+    def beam_count(self) -> int:
+        return max(self.layer_available_beams.values(), default=0)
+
+
+@dataclass
+class SingleBeamTod:
+    beam: str
+    frequency_mhz: np.ndarray
+    mjd: np.ndarray
+    raw: np.ndarray
+    union_mask: np.ndarray
+    auto_mask_files: dict[str, str]
+    warnings: list[str]
 
 
 def parse_tod_filename(path: str | Path) -> TodFile | None:
@@ -96,12 +152,12 @@ def parse_tod_filename(path: str | Path) -> TodFile | None:
 
 
 def discover_groups(input_dir: str | Path) -> list[TodGroup]:
-    """Group files by scan name and four-digit file serial across all beams."""
+    """Discover exact calibrated ``*_T.fits`` files and group all 19 beams."""
     input_dir = Path(input_dir)
     grouped: dict[tuple[str, str, str, str], list[TodFile]] = {}
-    for path in sorted(input_dir.glob("*.fits")):
+    for path in sorted(input_dir.rglob("*_T.fits")):
         item = parse_tod_filename(path)
-        if item is None:
+        if item is None or item.tail.lower() != "_t":
             continue
         key = (item.scan_name, item.serial, item.window, item.tail)
         grouped.setdefault(key, []).append(item)
@@ -123,7 +179,14 @@ def discover_groups(input_dir: str | Path) -> list[TodGroup]:
 
 def mask_path(mask_dir: str | Path, group: TodGroup) -> Path:
     safe_scan = re.sub(r"[^A-Za-z0-9+_.-]+", "_", group.scan_name)
-    return Path(mask_dir) / f"{safe_scan}_{group.serial}_manual_mask.json"
+    safe_window = re.sub(r"[^A-Za-z0-9+_.-]+", "_", group.window)
+    return Path(mask_dir) / (
+        f"{safe_scan}_{safe_window}_{group.serial}_T_manual_mask.json"
+    )
+
+
+def beam_mask_path(mask_dir: str | Path, item: TodFile) -> Path:
+    return Path(mask_dir) / f"{item.path.stem}_manual_rfi_mask.npz"
 
 
 def _merge_float_ranges(ranges: Iterable[Iterable[float]]) -> list[list[float]]:
@@ -156,11 +219,13 @@ def _merge_record_ranges(ranges: Iterable[Iterable[int]]) -> list[list[int]]:
     return merged
 
 
-def normalize_document(document: MaskDocument) -> MaskDocument:
-    while len(document.polarizations) < 2:
-        document.polarizations.append(PolarizationMask())
-    document.polarizations = document.polarizations[:2]
-    for pol_mask in document.polarizations:
+def _normalize_polarizations(
+    polarizations: list[PolarizationMask],
+) -> list[PolarizationMask]:
+    while len(polarizations) < 2:
+        polarizations.append(PolarizationMask())
+    polarizations = polarizations[:2]
+    for pol_mask in polarizations:
         pol_mask.frequency_ranges_mhz = _merge_float_ranges(
             pol_mask.frequency_ranges_mhz
         )
@@ -184,6 +249,22 @@ def normalize_document(document: MaskDocument) -> MaskDocument:
                 }
             )
         pol_mask.boxes = normalized_boxes
+    return polarizations
+
+
+def normalize_document(document: MaskDocument) -> MaskDocument:
+    document.polarizations = _normalize_polarizations(document.polarizations)
+    normalized_beams: dict[str, list[PolarizationMask]] = {}
+    for beam in sorted(set(document.beam_files) | set(document.beam_polarizations)):
+        if beam not in EXPECTED_BEAMS:
+            raise ValueError(f"Unsupported beam-specific manual mask: {beam!r}")
+        normalized_beams[beam] = _normalize_polarizations(
+            document.beam_polarizations.get(
+                beam, [PolarizationMask(), PolarizationMask()]
+            )
+        )
+    document.beam_polarizations = normalized_beams
+    document.authoring_scope_schema = AUTHORING_SCOPE_SCHEMA
     return document
 
 
@@ -205,8 +286,21 @@ def load_mask_document(path: str | Path, group: TodGroup) -> MaskDocument:
     if values.get("format") != MASK_FORMAT:
         raise ValueError(f"Unsupported mask format in {path}: {values.get('format')!r}")
     polarizations = [PolarizationMask(**item) for item in values.pop("polarizations", [])]
-    document = MaskDocument(polarizations=polarizations, **values)
-    if document.scan_name != group.scan_name or document.serial != group.serial:
+    beam_polarizations = {
+        str(beam).upper(): [PolarizationMask(**item) for item in items]
+        for beam, items in values.pop("beam_polarizations", {}).items()
+    }
+    document = MaskDocument(
+        polarizations=polarizations,
+        beam_polarizations=beam_polarizations,
+        **values,
+    )
+    if (
+        document.scan_name != group.scan_name
+        or document.serial != group.serial
+        or document.window != group.window
+        or document.stage != "T"
+    ):
         raise ValueError(f"Mask file {path} does not match {group.key}")
     document.beam_files = {
         item.beam: str(item.path.resolve()) for item in group.files
@@ -286,6 +380,14 @@ def _tod_axes(shape: tuple[int, ...], ntime: int, nfreq: int) -> tuple[int, int,
 def validate_group(group: TodGroup) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int]]:
     if not group.files:
         raise ValueError(f"No beam files in group {group.key}")
+    beams = tuple(sorted(item.beam for item in group.files))
+    if beams != EXPECTED_BEAMS:
+        missing = sorted(set(EXPECTED_BEAMS).difference(beams))
+        extra = sorted(set(beams).difference(EXPECTED_BEAMS))
+        raise ValueError(
+            f"Group {group.key} must contain exactly M01-M19; "
+            f"missing={missing}, extra={extra}"
+        )
     reference_freq, reference_time, reference_shape, _ = _read_axes(group.files[0].path)
     _tod_axes(reference_shape, len(reference_time), len(reference_freq))
     for item in group.files[1:]:
@@ -342,16 +444,242 @@ def load_beam_averaged_tod(
     return frequency, time, total
 
 
-def build_mask(
+def _scalar_text(value: np.ndarray) -> str:
+    return str(np.asarray(value).item())
+
+
+def _load_npz_native_mask(
+    path: Path,
+    *,
+    layer: str,
+    input_path: Path,
+    frequency: np.ndarray,
+    mjd: np.ndarray,
+    shape: tuple[int, int, int],
+) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as product:
+        required = {"mask", "freq", "mjd", "axis_order", "processing_mode"}
+        missing = sorted(required.difference(product.files))
+        if missing:
+            raise ValueError(f"{layer} mask {path} is missing keys {missing}")
+        mask = np.asarray(product["mask"])
+        mask_frequency = np.asarray(product["freq"], dtype=float)
+        mask_mjd = np.asarray(product["mjd"], dtype=float)
+        axis_order = _scalar_text(product["axis_order"])
+        processing_mode = _scalar_text(product["processing_mode"])
+        if layer == "sat1380":
+            sat_required = {"science_data_modified", "science_mask_eligible"}
+            sat_missing = sorted(sat_required.difference(product.files))
+            if sat_missing:
+                raise ValueError(f"SAT1380 mask lacks keys {sat_missing}: {path}")
+            if bool(np.asarray(product["science_data_modified"]).item()):
+                raise ValueError(f"SAT1380 product modified science data: {path}")
+            if not bool(np.asarray(product["science_mask_eligible"]).item()):
+                raise ValueError(f"SAT1380 product is not science-mask eligible: {path}")
+            expected_input = input_path.name
+            if "input_file" in product.files and _scalar_text(product["input_file"]) != expected_input:
+                raise ValueError(f"SAT1380 input provenance mismatch: {path}")
+    if mask.shape != shape:
+        raise ValueError(f"{layer} mask shape {mask.shape} != FLUX {shape}: {path}")
+    if axis_order != "time, frequency, polarization":
+        raise ValueError(f"Unexpected {layer} axis order {axis_order!r}: {path}")
+    if processing_mode != "mask_only":
+        raise ValueError(f"{layer} product is not mask_only: {path}")
+    if not np.array_equal(mask_frequency, frequency):
+        raise ValueError(f"{layer} frequency grid mismatch: {path}")
+    if not np.array_equal(mask_mjd, mjd):
+        raise ValueError(f"{layer} MJD grid mismatch: {path}")
+    return mask != 0
+
+
+def expected_auto_mask_paths(
+    input_path: Path,
+    directories: AutoMaskDirectories,
+) -> dict[str, Path]:
+    stem = input_path.stem
+    one_channel_directory = (
+        directories.one_channel
+        if directories.one_channel is not None
+        else input_path.parent / "one_channel_rfi_v2_products"
+    )
+    sat1380_directory = (
+        directories.sat1380
+        if directories.sat1380 is not None
+        else input_path.parent / "satellite_rfi_1380_products"
+    )
+    return {
+        "one_channel": one_channel_directory / f"{stem}_1channel_rfi_v2_mask.npz",
+        "sat1380": sat1380_directory / f"{stem}_satellite_rfi_1380_mask.npz",
+    }
+
+
+def load_auto_mask_layers(
+    input_path: Path,
+    directories: AutoMaskDirectories,
+    frequency: np.ndarray,
+    mjd: np.ndarray,
+    shape: tuple[int, int, int],
+    *,
+    require_all: bool = False,
+) -> tuple[dict[str, np.ndarray], dict[str, str], list[str]]:
+    layers: dict[str, np.ndarray] = {}
+    files: dict[str, str] = {}
+    warnings: list[str] = []
+    for layer, path in expected_auto_mask_paths(input_path, directories).items():
+        if not path.exists():
+            message = f"Missing {layer} mask for {input_path.name}: {path}"
+            if require_all:
+                raise FileNotFoundError(message)
+            warnings.append(message)
+            continue
+        mask = _load_npz_native_mask(
+            path,
+            layer=layer,
+            input_path=input_path,
+            frequency=frequency,
+            mjd=mjd,
+            shape=shape,
+        )
+        layers[layer] = mask
+        files[layer] = str(path.resolve())
+    return layers, files, warnings
+
+
+def load_beam_averaged_tod_with_auto_masks(
+    group: TodGroup,
+    directories: AutoMaskDirectories,
+    block_records: int = 128,
+    progress: Callable[[str], None] | None = None,
+    *,
+    require_all_masks: bool = False,
+) -> BeamAveragedTod:
+    """Average 19 beams before/after each beam's science-RFI mask union."""
+    frequency, mjd, output_shape = validate_group(group)
+    raw_total = np.zeros(output_shape, dtype=np.float32)
+    clean_total = np.zeros(output_shape, dtype=np.float32)
+    raw_count = np.zeros(output_shape, dtype=np.uint8)
+    clean_count = np.zeros(output_shape, dtype=np.uint8)
+    layer_counts = {
+        name: np.zeros(output_shape, dtype=np.uint8) for name in AUTO_LAYER_NAMES
+    }
+    union_count = np.zeros(output_shape, dtype=np.uint8)
+    available = {name: 0 for name in AUTO_LAYER_NAMES}
+    source_files = {item.beam: {} for item in group.files}
+    warnings: list[str] = []
+
+    for beam_number, item in enumerate(group.files, start=1):
+        if progress is not None:
+            progress(f"Loading {item.beam} ({beam_number}/19): {item.path.name}")
+        layers, files, layer_warnings = load_auto_mask_layers(
+            item.path,
+            directories,
+            frequency,
+            mjd,
+            output_shape,
+            require_all=require_all_masks,
+        )
+        source_files[item.beam] = files
+        warnings.extend(layer_warnings)
+        union = np.zeros(output_shape, dtype=bool)
+        for name, mask in layers.items():
+            layer_counts[name] += mask
+            union |= mask
+            available[name] += 1
+        union_count += union
+
+        with fits.open(item.path, memmap=True) as hdul:
+            _, _, tod_index = _select_hdus(hdul)
+            raw = hdul[tod_index].data
+            source_axes = _tod_axes(raw.shape, len(mjd), len(frequency))
+            canonical = np.moveaxis(raw, source_axes, (0, 1, 2))
+            for start in range(0, len(mjd), max(1, int(block_records))):
+                stop = min(start + max(1, int(block_records)), len(mjd))
+                block = np.asarray(canonical[start:stop, :, :2], dtype=np.float32)
+                finite = np.isfinite(block)
+                clean = finite & ~union[start:stop]
+                raw_total[start:stop] += np.where(finite, block, 0.0)
+                clean_total[start:stop] += np.where(clean, block, 0.0)
+                raw_count[start:stop] += finite
+                clean_count[start:stop] += clean
+        del union, layers
+
+    np.divide(raw_total, raw_count, out=raw_total, where=raw_count > 0)
+    np.divide(clean_total, clean_count, out=clean_total, where=clean_count > 0)
+    raw_total[raw_count == 0] = np.nan
+    clean_total[clean_count == 0] = np.nan
+    if frequency[0] > frequency[-1]:
+        frequency = frequency[::-1].copy()
+        raw_total = raw_total[:, ::-1, :].copy()
+        clean_total = clean_total[:, ::-1, :].copy()
+        union_count = union_count[:, ::-1, :].copy()
+        layer_counts = {name: values[:, ::-1, :].copy() for name, values in layer_counts.items()}
+    return BeamAveragedTod(
+        frequency_mhz=frequency,
+        mjd=mjd,
+        raw_mean=raw_total,
+        auto_masked_mean=clean_total,
+        layer_flagged_beam_count=layer_counts,
+        union_flagged_beam_count=union_count,
+        layer_available_beams=available,
+        auto_mask_files=source_files,
+        warnings=warnings,
+    )
+
+
+def load_single_beam_tod_with_auto_masks(
+    item: TodFile,
+    directories: AutoMaskDirectories,
+    block_records: int = 128,
+    *,
+    require_all_masks: bool = False,
+) -> SingleBeamTod:
+    """Load one beam and its own science-RFI mask union on the native TOD grid."""
+    frequency, mjd, source_shape, _ = _read_axes(item.path)
+    source_axes = _tod_axes(source_shape, len(mjd), len(frequency))
+    output_shape = (len(mjd), len(frequency), 2)
+    layers, files, warnings = load_auto_mask_layers(
+        item.path,
+        directories,
+        frequency,
+        mjd,
+        output_shape,
+        require_all=require_all_masks,
+    )
+    union = np.zeros(output_shape, dtype=bool)
+    for mask in layers.values():
+        union |= mask
+
+    raw_values = np.empty(output_shape, dtype=np.float32)
+    with fits.open(item.path, memmap=True) as hdul:
+        _, _, tod_index = _select_hdus(hdul)
+        canonical = np.moveaxis(hdul[tod_index].data, source_axes, (0, 1, 2))
+        step = max(1, int(block_records))
+        for start in range(0, len(mjd), step):
+            stop = min(start + step, len(mjd))
+            raw_values[start:stop] = np.asarray(
+                canonical[start:stop, :, :2], dtype=np.float32
+            )
+
+    if frequency[0] > frequency[-1]:
+        frequency = frequency[::-1].copy()
+        raw_values = raw_values[:, ::-1, :].copy()
+        union = union[:, ::-1, :].copy()
+    return SingleBeamTod(
+        beam=item.beam,
+        frequency_mhz=frequency,
+        mjd=mjd,
+        raw=raw_values,
+        union_mask=union,
+        auto_mask_files=files,
+        warnings=warnings,
+    )
+
+
+def _expand_polarization_mask(
     frequency_mhz: np.ndarray,
     ntime: int,
-    document: MaskDocument,
-    polarization: int,
+    pol_mask: PolarizationMask,
 ) -> np.ndarray:
-    """Expand one polarization's compact ranges into a time-frequency mask."""
-    if polarization not in (0, 1):
-        raise ValueError("polarization must be 0 or 1")
-    pol_mask = document.polarizations[polarization]
     mask = np.zeros((ntime, len(frequency_mhz)), dtype=bool)
     for lo, hi in pol_mask.frequency_ranges_mhz:
         mask[:, (frequency_mhz >= lo) & (frequency_mhz <= hi)] = True
@@ -365,18 +693,44 @@ def build_mask(
     return mask
 
 
+def build_mask(
+    frequency_mhz: np.ndarray,
+    ntime: int,
+    document: MaskDocument,
+    polarization: int,
+    beam: str | None = None,
+) -> np.ndarray:
+    """Expand the global layer, optionally OR-ing one beam-specific layer."""
+    if polarization not in (0, 1):
+        raise ValueError("polarization must be 0 or 1")
+    mask = _expand_polarization_mask(
+        frequency_mhz, ntime, document.polarizations[polarization]
+    )
+    if beam is not None:
+        beam = str(beam).upper()
+        beam_layers = document.beam_polarizations.get(beam)
+        if beam_layers is not None:
+            mask |= _expand_polarization_mask(
+                frequency_mhz, ntime, beam_layers[polarization]
+            )
+    return mask
+
+
 def apply_mask(
     tod: np.ndarray,
     frequency_mhz: np.ndarray,
     document: MaskDocument,
     copy: bool = True,
+    beam: str | None = None,
 ) -> np.ndarray:
     """Apply both polarization masks to canonical TOD shaped (time, frequency, pol)."""
     if tod.ndim != 3 or tod.shape[2] < 2:
         raise ValueError("TOD must have shape (time, frequency, polarization>=2)")
     result = np.array(tod, copy=True) if copy else tod
     for polarization in (0, 1):
-        expanded = build_mask(frequency_mhz, tod.shape[0], document, polarization)
+        expanded = build_mask(
+            frequency_mhz, tod.shape[0], document, polarization, beam=beam
+        )
         result[:, :, polarization][expanded] = np.nan
     return result
 
@@ -385,6 +739,8 @@ def masked_time_average(
     tod: np.ndarray,
     frequency_mhz: np.ndarray,
     document: MaskDocument,
+    additional_mask: np.ndarray | None = None,
+    beam: str | None = None,
 ) -> np.ndarray:
     """Average unmasked records for each frequency and polarization.
 
@@ -395,13 +751,123 @@ def masked_time_average(
         raise ValueError("TOD must have shape (time, frequency, polarization>=2)")
     if tod.shape[1] != len(frequency_mhz):
         raise ValueError("TOD frequency axis does not match frequency_mhz")
+    if additional_mask is not None and additional_mask.shape != tod.shape:
+        raise ValueError("additional_mask must match the TOD shape")
 
     spectra = np.full((tod.shape[1], 2), np.nan, dtype=np.float64)
     for polarization in (0, 1):
         values = np.asarray(tod[:, :, polarization])
-        mask = build_mask(frequency_mhz, tod.shape[0], document, polarization)
+        mask = build_mask(
+            frequency_mhz, tod.shape[0], document, polarization, beam=beam
+        )
         valid = np.isfinite(values) & ~mask
+        if additional_mask is not None:
+            valid &= ~additional_mask[:, :, polarization]
         count = np.sum(valid, axis=0, dtype=np.int64)
         total = np.sum(values, axis=0, dtype=np.float64, where=valid)
         np.divide(total, count, out=spectra[:, polarization], where=count > 0)
     return spectra
+
+
+def _region_counts(polarizations: list[PolarizationMask]) -> dict[str, int]:
+    by_pol = [
+        len(layer.frequency_ranges_mhz)
+        + len(layer.time_ranges_records)
+        + len(layer.boxes)
+        for layer in polarizations
+    ]
+    return {"pol0": by_pol[0], "pol1": by_pol[1], "total": sum(by_pol)}
+
+
+def mask_document_region_summary(document: MaskDocument) -> dict[str, object]:
+    """Count normalized authoring regions without expanding the native grid."""
+    normalized = normalize_document(document)
+    beams = sorted(set(normalized.beam_files) | set(normalized.beam_polarizations))
+    return {
+        "mean": _region_counts(normalized.polarizations),
+        "beams": {
+            beam: _region_counts(
+                normalized.beam_polarizations.get(
+                    beam, [PolarizationMask(), PolarizationMask()]
+                )
+            )
+            for beam in beams
+        },
+    }
+
+
+def save_beam_mask_products(
+    mask_dir: str | Path,
+    *,
+    group: TodGroup,
+    frequency_mhz: np.ndarray,
+    mjd: np.ndarray,
+    document: MaskDocument,
+    json_path: str | Path,
+) -> list[Path]:
+    """Write one manual-only, exact-grid mask product for each input beam."""
+    global_manual = np.stack(
+        [
+            build_mask(frequency_mhz, len(mjd), document, polarization)
+            for polarization in (0, 1)
+        ],
+        axis=2,
+    ).astype(np.uint8)
+    json_path = Path(json_path).resolve()
+    json_sha256 = hashlib.sha256(json_path.read_bytes()).hexdigest()
+    output_paths = []
+    for item in group.files:
+        manual = global_manual.copy()
+        beam_layers = document.beam_polarizations.get(item.beam)
+        beam_specific_count = 0
+        if beam_layers is not None:
+            for polarization in (0, 1):
+                specific = _expand_polarization_mask(
+                    frequency_mhz,
+                    len(mjd),
+                    beam_layers[polarization],
+                )
+                beam_specific_count += int(np.count_nonzero(specific))
+                manual[:, :, polarization] |= specific
+        if not set(np.unique(manual)).issubset({0, 1}):
+            raise ValueError("Manual mask must contain only 0 and 1")
+        flagged_count = int(np.count_nonzero(manual))
+        target = beam_mask_path(mask_dir, item)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        with temporary.open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                mask=manual,
+                freq=np.asarray(frequency_mhz, dtype=np.float64),
+                mjd=np.asarray(mjd, dtype=np.float64),
+                axis_order=np.asarray("time, frequency, polarization"),
+                processing_mode=np.asarray("mask_only"),
+                science_data_modified=np.asarray(False),
+                mask_role=np.asarray("manual_rfi_science_bad"),
+                flag_manual=np.asarray(1, dtype=np.uint8),
+                input_file=np.asarray(item.path.name),
+                beam=np.asarray(item.beam),
+                scan_name=np.asarray(group.scan_name),
+                window=np.asarray(group.window),
+                nfile=np.asarray(group.serial),
+                reviewed_clean=np.asarray(flagged_count == 0),
+                manual_sample_count=np.asarray(flagged_count, dtype=np.int64),
+                manual_global_sample_count=np.asarray(
+                    np.count_nonzero(global_manual), dtype=np.int64
+                ),
+                manual_beam_specific_sample_count=np.asarray(
+                    beam_specific_count, dtype=np.int64
+                ),
+                manual_counts_by_pol=np.asarray(
+                    [np.count_nonzero(manual[:, :, pol]) for pol in (0, 1)],
+                    dtype=np.int64,
+                ),
+                source_json=np.asarray(str(json_path)),
+                source_json_sha256=np.asarray(json_sha256),
+                format=np.asarray(MASK_FORMAT),
+                schema_version=np.asarray(BEAM_MASK_SCHEMA_VERSION),
+            )
+        temporary.replace(target)
+        output_paths.append(target)
+    return output_paths

@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import copy
 from dataclasses import dataclass
 import gc
+import json
 from pathlib import Path
 import sys
+import threading
+import time
 
 import matplotlib.pyplot as plt
 from matplotlib.backend_bases import MouseButton
@@ -17,16 +21,20 @@ from matplotlib.widgets import Button, CheckButtons, RectangleSelector
 import numpy as np
 
 from crafts_tod_mask import (
+    AutoMaskDirectories,
+    BeamAveragedTod,
     MaskDocument,
     TodGroup,
+    beam_mask_path,
     discover_groups,
-    load_beam_averaged_tod,
+    load_beam_averaged_tod_with_auto_masks,
     load_mask_document,
     mask_is_done,
     mask_path,
     masked_time_average,
     normalize_document,
     save_mask_document,
+    save_beam_mask_products,
     validate_group,
 )
 
@@ -35,6 +43,186 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = ROOT.parent
 DEFAULT_MASK_DIR = ROOT / "masks"
 MASK_COLOR = "#d62728"
+STATUS_LINES: deque[str] = deque(maxlen=400)
+STATUS_LOCK = threading.Lock()
+STATUS_STATE: dict[str, object] = {
+    "busy": True,
+    "phase": "starting",
+    "message": "程序正在启动",
+    "updated_at": time.time(),
+}
+
+
+def status_message(message: object, *, phase: str | None = None, busy: bool | None = None) -> None:
+    """Print and retain a short status history for the browser console."""
+    text = str(message)
+    timestamp = time.strftime("%H:%M:%S")
+    with STATUS_LOCK:
+        STATUS_LINES.append(f"[{timestamp}] {text}")
+        STATUS_STATE["message"] = text
+        STATUS_STATE["updated_at"] = time.time()
+        if phase is not None:
+            STATUS_STATE["phase"] = phase
+        if busy is not None:
+            STATUS_STATE["busy"] = bool(busy)
+    print(text, flush=True)
+
+
+def web_status_payload() -> dict[str, object]:
+    with STATUS_LOCK:
+        return {**STATUS_STATE, "lines": list(STATUS_LINES)}
+
+
+def _console_page_html(figure_ids: list[int], prefix: str = "") -> str:
+    """Return a WebAgg page with a native browser-side status console."""
+    ids = json.dumps(figure_ids)
+    prefix_json = json.dumps(prefix)
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{prefix}/_static/css/page.css" type="text/css">
+  <link rel="stylesheet" href="{prefix}/_static/css/boilerplate.css" type="text/css">
+  <link rel="stylesheet" href="{prefix}/_static/css/fbm.css" type="text/css">
+  <link rel="stylesheet" href="{prefix}/_static/css/mpl.css" type="text/css">
+  <script src="{prefix}/_static/js/mpl_tornado.js"></script>
+  <script src="{prefix}/js/mpl.js"></script>
+  <style>
+    html, body {{ margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }}
+    #layout {{ display: flex; width: 100vw; height: 100vh; }}
+    #figures {{ flex: 1 1 auto; min-width: 0; overflow: auto; padding: 8px; }}
+    #console {{ flex: 0 0 360px; display: flex; flex-direction: column; color: #d8dee9;
+                background: #111820; border-left: 1px solid #45515f; }}
+    #console header {{ padding: 12px; background: #18222d; border-bottom: 1px solid #45515f; }}
+    #badge {{ display: inline-block; margin-top: 8px; padding: 4px 9px; border-radius: 12px;
+              font-weight: 700; background: #8a5a00; color: white; }}
+    #badge.ready {{ background: #26734d; }}
+    #badge.waiting {{ background: #9a3412; }}
+    #interaction {{ padding: 9px 12px; color: #ffe08a; border-bottom: 1px solid #45515f;
+                    min-height: 2.4em; }}
+    #log {{ flex: 1 1 auto; margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap;
+            overflow-wrap: anywhere; font: 12px/1.45 Menlo, Monaco, monospace; }}
+    .hint {{ color: #a9b7c6; font-size: 12px; margin-top: 7px; }}
+  </style>
+  <title>CRAFTS Manual RFI Mask</title>
+</head>
+<body>
+<div id="layout">
+  <div id="figures"></div>
+  <aside id="console">
+    <header><strong>服务器运行状态</strong><br><span id="badge">正在连接…</span>
+      <div class="hint">这里显示读取、计算、交互和保存日志。</div></header>
+    <div id="interaction">鼠标状态：等待操作</div>
+    <pre id="log">正在获取服务器日志…</pre>
+  </aside>
+</div>
+<script>
+const prefix = {prefix_json};
+const figureIds = {ids};
+const badge = document.getElementById('badge');
+const logBox = document.getElementById('log');
+const interaction = document.getElementById('interaction');
+let lastReply = Date.now();
+
+function setInteraction(text) {{ interaction.textContent = '鼠标状态：' + text; }}
+function createFigure(figId) {{
+  const host = document.getElementById('figures');
+  const figureDiv = document.createElement('div');
+  host.appendChild(figureDiv);
+  const wsType = mpl.get_websocket_type();
+  let uri = 'ws://' + window.location.host + prefix + '/' + figId + '/ws';
+  if (window.location.protocol === 'https:') uri = uri.replace('ws:', 'wss:');
+  const websocket = new wsType(uri);
+  const fig = new mpl.figure(figId, websocket, mpl_ondownload, figureDiv);
+  fig.focus_on_mouseover = true;
+  fig.canvas.setAttribute('tabindex', figId);
+  fig.canvas_div.addEventListener('mousedown', () => setInteraction('已按下；请继续拖动后松开'));
+  // Stock WebAgg forwards every mousemove and can request dozens of remote
+  // PNG redraws per second.  Capture and throttle it for an SSH tunnel.
+  let lastMotion = 0;
+  fig.canvas_div.addEventListener('mousemove', (event) => {{
+    event.stopImmediatePropagation();
+    if (event.buttons) setInteraction('正在拖动选区…');
+    const now = performance.now();
+    if (now - lastMotion >= 120) {{
+      lastMotion = now;
+      fig.mouse_event(event, 'motion_notify');
+    }}
+  }}, true);
+  fig.canvas_div.addEventListener('mouseup', () => setInteraction('已松开；等待服务器处理'));
+  websocket.addEventListener('open', () => setInteraction('WebSocket 已连接，可以拖拽'));
+  websocket.addEventListener('close', () => setInteraction('WebSocket 已断开，请刷新页面'));
+}}
+figureIds.forEach(createFigure);
+
+async function pollStatus() {{
+  try {{
+    const response = await fetch(prefix + '/status.json?t=' + Date.now(), {{cache: 'no-store'}});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    lastReply = Date.now();
+    badge.className = data.busy ? '' : 'ready';
+    badge.textContent = data.busy ? '正在读取或计算' : '服务器可交互';
+    logBox.textContent = (data.lines || []).join('\\n');
+    logBox.scrollTop = logBox.scrollHeight;
+  }} catch (error) {{
+    if (Date.now() - lastReply > 2500) {{
+      badge.className = 'waiting';
+      badge.textContent = '服务器忙或暂时无响应';
+    }}
+  }} finally {{
+    // Schedule only after the previous request has settled.  This prevents a
+    // busy renderer from accumulating aborted SSH-forwarded HTTP connections.
+    setTimeout(pollStatus, 1500);
+  }}
+}}
+pollStatus();
+setInterval(() => {{
+  if (Date.now() - lastReply > 3000) {{
+    badge.className = 'waiting';
+    badge.textContent = '服务器忙或暂时无响应';
+  }}
+}}, 500);
+</script>
+</body>
+</html>"""
+
+
+def install_webagg_status_console() -> None:
+    """Replace the stock WebAgg index with a figure plus live log console."""
+    import matplotlib.backends.backend_webagg as webagg
+    from matplotlib._pylab_helpers import Gcf
+    import tornado.web
+
+    base_application = webagg.WebAggApplication
+    if getattr(base_application, "_crafts_console", False):
+        return
+
+    class StatusHandler(tornado.web.RequestHandler):
+        def get(self) -> None:
+            self.set_header("Cache-Control", "no-store")
+            self.write(web_status_payload())
+
+    class ConsoleFiguresPage(base_application.AllFiguresPage):
+        def get(self) -> None:
+            self.set_header("Content-Type", "text/html; charset=UTF-8")
+            self.write(_console_page_html(sorted(Gcf.figs), self.url_prefix))
+
+    class ConsoleWebAggApplication(base_application):
+        initialized = False
+        started = False
+        _crafts_console = True
+        AllFiguresPage = ConsoleFiguresPage
+
+        def __init__(self, url_prefix: str = "") -> None:
+            super().__init__(url_prefix=url_prefix)
+            self.add_handlers(
+                r".*$",
+                [(url_prefix + r"/status\.json", StatusHandler)],
+            )
+
+    webagg.WebAggApplication = ConsoleWebAggApplication
 
 
 @dataclass(frozen=True)
@@ -73,10 +261,28 @@ def contrast_limits_from_drag(
     return adjusted
 
 
+def configure_webagg(port: int) -> None:
+    """Bind WebAgg to localhost on one deterministic SSH-forwarded port."""
+    port = int(port)
+    if not 1024 <= port <= 65535:
+        raise ValueError("--web-port must be between 1024 and 65535")
+    if "webagg" not in plt.get_backend().lower():
+        raise RuntimeError(
+            "--web-port requires MPLBACKEND=WebAgg; use the browser launcher"
+        )
+    plt.rcParams["webagg.address"] = "127.0.0.1"
+    plt.rcParams["webagg.port"] = port
+    # This Matplotlib version interprets the value as the total number of
+    # candidate ports, not as retries after the first attempt.  One therefore
+    # means "try exactly the requested port".
+    plt.rcParams["webagg.port_retries"] = 1
+    plt.rcParams["webagg.open_in_browser"] = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Average all available CRAFTS beams and interactively mask the two "
+            "Average all 19 CRAFTS beams and interactively mask the two "
             "polarizations. With no target, print the grouped scan list."
         )
     )
@@ -87,6 +293,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--mask-dir", type=Path, default=DEFAULT_MASK_DIR)
+    parser.add_argument(
+        "--one-channel-dir", type=Path,
+        help="Override OneChannel directory; default is each FITS file's sibling product directory.",
+    )
+    parser.add_argument(
+        "--sat1380-dir", type=Path,
+        help="Override SAT1380 directory; default is each FITS file's sibling product directory.",
+    )
+    parser.add_argument(
+        "--require-all-auto-masks", action="store_true",
+        help="Fail if either science-RFI mask is absent for any beam.",
+    )
     parser.add_argument("--list", action="store_true", help="Print the scan list and exit.")
     parser.add_argument(
         "--validate",
@@ -99,6 +317,11 @@ def parse_args() -> argparse.Namespace:
         help="Render the selected entry to a PNG without opening the GUI.",
     )
     parser.add_argument("--block-records", type=int, default=128)
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        help="Deterministic localhost port for MPLBACKEND=WebAgg over SSH forwarding.",
+    )
     return parser.parse_args()
 
 
@@ -140,15 +363,21 @@ class CraftsTodMaskEditor:
         groups: list[TodGroup],
         group_index: int,
         mask_dir: Path,
+        auto_mask_directories: AutoMaskDirectories,
         block_records: int = 128,
+        require_all_auto_masks: bool = False,
     ) -> None:
         self.groups = groups
         self.group_index = group_index
         self.mask_dir = mask_dir
+        self.auto_mask_directories = auto_mask_directories
+        self.require_all_auto_masks = require_all_auto_masks
         self.block_records = max(1, int(block_records))
         self.mode = "box"
         self.apply_both_pols = False
         self.vertical_wheel_enabled = False
+        self.apply_auto_rfi = True
+        self.show_auto_rfi = True
         self.shift_held = False
         self.pan_enabled = False
         self.pan_drag: tuple[float, tuple[float, float]] | None = None
@@ -159,6 +388,9 @@ class CraftsTodMaskEditor:
         self.frequency = np.empty(0)
         self.time = np.empty(0)
         self.tod = np.empty((0, 0, 2), dtype=np.float32)
+        self.raw_tod = np.empty((0, 0, 2), dtype=np.float32)
+        self.auto_masked_tod = np.empty((0, 0, 2), dtype=np.float32)
+        self.aggregate: BeamAveragedTod | None = None
         self.local_medians = [0.0, 0.0]
         self.full_xlim = (0.0, 1.0)
         self.full_ylim = (0.0, 1.0)
@@ -201,30 +433,52 @@ class CraftsTodMaskEditor:
             return
         self.group_index = index % len(self.groups)
         group = self.group
-        print(
+        status_message(
             f"Selected #{self.group_index + 1}: {group.scan_name} file {group.serial}; "
-            f"beams={','.join(group.beams)}"
+            f"beams={','.join(group.beams)}",
+            phase="loading",
+            busy=True,
         )
-        self.frequency, self.time, self.tod = load_beam_averaged_tod(
-            group,
-            block_records=self.block_records,
-            progress=print,
-        )
+        try:
+            self.aggregate = load_beam_averaged_tod_with_auto_masks(
+                group,
+                self.auto_mask_directories,
+                block_records=self.block_records,
+                progress=status_message,
+                require_all_masks=self.require_all_auto_masks,
+            )
+        except Exception as error:
+            status_message(f"ERROR while loading: {error}", phase="error", busy=False)
+            raise
+        self.frequency = self.aggregate.frequency_mhz
+        self.time = self.aggregate.mjd
+        self.raw_tod = self.aggregate.raw_mean
+        self.auto_masked_tod = self.aggregate.auto_masked_mean
         self.document = load_mask_document(mask_path(self.mask_dir, group), group)
+        self.document.auto_mask_files = self.aggregate.auto_mask_files
         self.undo_stack.clear()
         self.dirty = False
         self.contrast_level = 0
         self.local_medians = []
         for polarization in (0, 1):
-            sample = self._sample(self.tod[:, :, polarization])
+            sample = self._sample(self.raw_tod[:, :, polarization])
             median = float(np.nanmedian(sample))
             self.local_medians.append(median)
-            self.tod[:, :, polarization] -= median
+            self.raw_tod[:, :, polarization] -= median
+            self.auto_masked_tod[:, :, polarization] -= median
+        self.tod = self.auto_masked_tod if self.apply_auto_rfi else self.raw_tod
         self.full_xlim = (float(self.frequency[0]), float(self.frequency[-1]))
         self.full_ylim = (0.0, float(len(self.time)))
         self.masked_spectra = np.empty((0, 2), dtype=np.float64)
         self.build_figure()
+        for warning in self.aggregate.warnings:
+            status_message(f"WARNING: {warning}")
         gc.collect()
+        status_message(
+            f"Ready: {group.scan_name} file {group.serial}; drag inside a waterfall panel",
+            phase="ready",
+            busy=False,
+        )
 
     @staticmethod
     def _sample(values: np.ndarray, max_values: int = 600_000) -> np.ndarray:
@@ -353,19 +607,31 @@ class CraftsTodMaskEditor:
             if mode is not None:
                 self.mode_buttons[mode] = button
 
-        check_axis = self.fig.add_axes([0.80, 0.052, 0.13, 0.09])
+        check_axis = self.fig.add_axes([0.80, 0.035, 0.17, 0.125])
         self.both_check = CheckButtons(
             check_axis,
-            ["both pols", "vertical wheel"],
-            [self.apply_both_pols, self.vertical_wheel_enabled],
+            ["both pols", "vertical wheel", "apply auto RFI", "show auto RFI"],
+            [
+                self.apply_both_pols,
+                self.vertical_wheel_enabled,
+                self.apply_auto_rfi,
+                self.show_auto_rfi,
+            ],
         )
         self.both_check.on_clicked(self.toggle_options)
         self.status_text = self.fig.text(0.075, 0.018, "", fontsize=8.5, va="bottom")
 
     def default_status(self) -> str:
         state = "done" if self.document.done and not self.dirty else "unsaved" if self.dirty else "pending"
+        availability = ""
+        if self.aggregate is not None:
+            availability = (
+                " | masks: OneChannel "
+                f"{self.aggregate.layer_available_beams['one_channel']}/19, "
+                f"SAT1380 {self.aggregate.layer_available_beams['sat1380']}/19"
+            )
         return (
-            f"{state} | mode={self.mode} | drag in a panel to edit that polarization; "
+            f"{state} | mode={self.mode}{availability} | drag in a panel to edit that polarization; "
             "right-drag contrast (horizontal=center, vertical=range); "
             "wheel=x zoom, Shift+wheel or v/vertical-wheel=record zoom; "
             "f/t/b/d modes, u undo, s save, g pan, ,/. shift view, 0 reset"
@@ -375,7 +641,7 @@ class CraftsTodMaskEditor:
         if hasattr(self, "status_text"):
             self.status_text.set_text(message)
             self.fig.canvas.draw_idle()
-        print(message)
+        status_message(message)
 
     def target_polarizations(self, selected: int) -> tuple[int, ...]:
         return (0, 1) if self.apply_both_pols else (selected,)
@@ -404,9 +670,18 @@ class CraftsTodMaskEditor:
 
     def toggle_options(self, _label: str) -> None:
         if self.both_check is not None:
-            both_pols, vertical_wheel = self.both_check.get_status()
+            both_pols, vertical_wheel, apply_auto_rfi, show_auto_rfi = self.both_check.get_status()
             self.apply_both_pols = bool(both_pols)
             self.vertical_wheel_enabled = bool(vertical_wheel)
+            changed_data = self.apply_auto_rfi != bool(apply_auto_rfi)
+            self.apply_auto_rfi = bool(apply_auto_rfi)
+            self.show_auto_rfi = bool(show_auto_rfi)
+            if changed_data:
+                self.tod = self.auto_masked_tod if self.apply_auto_rfi else self.raw_tod
+                for polarization, image in enumerate(self.images):
+                    image.set_data(self.tod[:, :, polarization])
+                    image.set_clim(*self.robust_limits(polarization))
+            self.draw_mask_overlays()
         self.set_status(self.default_status())
 
     def on_select(self, polarization: int, click, release) -> None:
@@ -503,6 +778,26 @@ class CraftsTodMaskEditor:
             artist.remove()
         self.overlay_artists = []
         for polarization, axis in enumerate(self.axes):
+            if self.show_auto_rfi and self.aggregate is not None:
+                flagged_beams = np.ma.masked_equal(
+                    self.aggregate.union_flagged_beam_count[:, :, polarization],
+                    0,
+                    copy=False,
+                )
+                auto_artist = axis.imshow(
+                    flagged_beams,
+                    origin="lower",
+                    aspect="auto",
+                    interpolation="nearest",
+                    extent=[self.frequency[0], self.frequency[-1], 0, len(self.time)],
+                    cmap="autumn",
+                    vmin=1,
+                    vmax=19,
+                    alpha=0.38,
+                    zorder=3,
+                    rasterized=True,
+                )
+                self.overlay_artists.append(auto_artist)
             pol_mask = self.document.polarizations[polarization]
             for low, high in pol_mask.frequency_ranges_mhz:
                 self.overlay_artists.append(
@@ -548,10 +843,23 @@ class CraftsTodMaskEditor:
 
     def save(self, _event=None) -> None:
         self.document.done = True
-        save_mask_document(mask_path(self.mask_dir, self.group), self.document)
+        json_target = mask_path(self.mask_dir, self.group)
+        if self.aggregate is None:
+            raise RuntimeError("No beam-averaged data loaded")
+        self.document.auto_mask_files = self.aggregate.auto_mask_files
+        save_mask_document(json_target, self.document)
+        beam_targets = save_beam_mask_products(
+            self.mask_dir,
+            group=self.group,
+            frequency_mhz=self.frequency,
+            mjd=self.time,
+            document=self.document,
+            json_path=json_target,
+        )
         self.dirty = False
         self.set_status(
-            f"Saved and marked done: {mask_path(self.mask_dir, self.group)}"
+            f"Saved JSON + {len(beam_targets)} beam NPZ products and marked done: "
+            f"{json_target}; {beam_mask_path(self.mask_dir, self.group.files[0])} ..."
         )
 
     def cycle_contrast(self, _event=None) -> None:
@@ -725,8 +1033,29 @@ class CraftsTodMaskEditor:
 
 def main() -> None:
     args = parse_args()
+    if args.web_port is not None:
+        try:
+            configure_webagg(args.web_port)
+            install_webagg_status_console()
+            status_message(
+                f"Starting Web UI on 127.0.0.1:{args.web_port}",
+                phase="starting",
+                busy=True,
+            )
+        except (RuntimeError, ValueError) as error:
+            raise SystemExit(str(error)) from error
     input_dir = args.input_dir.expanduser().resolve()
     mask_dir = args.mask_dir.expanduser().resolve()
+    auto_mask_directories = AutoMaskDirectories(
+        one_channel=(
+            args.one_channel_dir.expanduser().resolve()
+            if args.one_channel_dir is not None else None
+        ),
+        sat1380=(
+            args.sat1380_dir.expanduser().resolve()
+            if args.sat1380_dir is not None else None
+        ),
+    )
     groups = discover_groups(input_dir)
     if not groups:
         raise SystemExit(f"No matching FITS files under {input_dir}")
@@ -754,7 +1083,14 @@ def main() -> None:
         group_index = resolve_group_index(target, groups)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    editor = CraftsTodMaskEditor(groups, group_index, mask_dir, args.block_records)
+    editor = CraftsTodMaskEditor(
+        groups,
+        group_index,
+        mask_dir,
+        auto_mask_directories,
+        args.block_records,
+        args.require_all_auto_masks,
+    )
     if args.snapshot is not None:
         snapshot = args.snapshot.expanduser().resolve()
         snapshot.parent.mkdir(parents=True, exist_ok=True)
