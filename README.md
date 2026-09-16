@@ -167,3 +167,31 @@ Run the small mask-model tests:
 ```bash
 python -m pytest -q test_crafts_tod_mask.py
 ```
+
+## Update Log
+
+### 2026-09-16 — Web viewport navigation and beam comparison
+
+- Pointer-anchored zoom on the waterfalls and spectrum: `Option/Alt + wheel`
+  zooms frequency, `Shift + wheel` zooms the record axis. `Option/Alt +
+  left-drag`, `Shift + left-drag`, or both modifiers together enlarge a
+  dragged range; the same tools work without modifiers via
+  `显示设置 → 频率放大 / 时间放大`. Zoom gestures only change the viewing
+  range and never edit the mask.
+- `返回视图` returns to the previous viewing range and `重置视图 0` restores
+  the full frequency and record range; both are view-only and do not undo
+  manual edits.
+- While navigating, the page previews the cached image locally and merges
+  consecutive requests into the latest viewport. Marking and deleting wait
+  for the final `清晰视图` image, preventing edits against a stale view.
+- In Single-beam mode the spectrum draws the current beam as a solid line and
+  keeps the 19-beam Mean as a dashed reference at 48% opacity. The reference
+  remains `global_manual_only`: per-beam manual regions are not merged into
+  it, and the automatic-RFI switch applies to both curves. Spectrum drawing
+  preserves the per-pixel extrema and NaN gaps.
+- Adjustable layout: `显示设置 → 频谱高度` sets the spectrum share (default
+  24%, range 18%–40%; the two waterfalls stay equal in height). The
+  status/log sidebar can be resized via its divider or collapsed from the
+  top bar; these preferences persist in the browser.
+- The automatic-RFI overlay pooling now reduces records before channels,
+  cutting single-view render time by about 23%–35% on CRAFTS-sized inputs.
