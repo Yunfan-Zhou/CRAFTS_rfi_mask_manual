@@ -112,7 +112,9 @@ def _mask_pool(
     pooled_width = int(np.ceil(source_width / factor_x))
     padded = np.zeros((pooled_height * factor_y, pooled_width * factor_x), dtype=np.uint8)
     padded[:source_height, :source_width] = source
-    pooled = padded.reshape(pooled_height, factor_y, pooled_width, factor_x).max(axis=(1, 3))
+    pooled = padded.reshape(pooled_height, factor_y, pooled_width, factor_x)
+    # Reduce records first to scan contiguous frequency rows before channel bins.
+    pooled = pooled.max(axis=1).max(axis=2)
     if pooled.shape != (height, width):
         pooled = np.asarray(
             Image.fromarray(pooled).resize((width, height), resample=Image.Resampling.NEAREST),
@@ -237,6 +239,10 @@ class NativeMaskState:
         }
         self.single_loading = False
         self.spectrum_revision = 0
+        self.spectrum_content_revision = 0
+        self._spectrum_request_token = 0
+        self._spectrum_task: asyncio.Task[None] | None = None
+        self._view_request_token = 0
         self.revision = 0
         self.dirty = False
         self.phase = "starting"
@@ -377,7 +383,9 @@ class NativeMaskState:
             if self.aggregate is None:
                 raise ValueError("Data are still loading")
             if view_mode == "mean":
+                self._view_request_token += 1
                 self.view_mode = "mean"
+                self.single_loading = False
                 self.image_cache.clear()
                 self._log("Showing 19-beam mean", "ready", False)
                 return
@@ -385,9 +393,14 @@ class NativeMaskState:
             item = next((candidate for candidate in self.group.files if candidate.beam == beam), None)
             if item is None:
                 raise ValueError(f"Beam {beam!r} is not available")
+            self._view_request_token += 1
+            request_token = self._view_request_token
+            load_token = self.load_token
+            aggregate = self.aggregate
             self.selected_beam = beam
             if self.single is not None and self.single.beam == beam:
                 self.view_mode = "single"
+                self.single_loading = False
                 self.image_cache.clear()
                 self._log(f"Showing single beam {beam}", "ready", False)
                 return
@@ -426,7 +439,12 @@ class NativeMaskState:
                 self.executor, read_single
             )
             with self.lock:
-                if self.group.key != group_key:
+                if (
+                    request_token != self._view_request_token
+                    or load_token != self.load_token
+                    or aggregate is not self.aggregate
+                    or self.group.key != group_key
+                ):
                     return
                 self.single = single
                 self.single_medians = medians
@@ -441,7 +459,14 @@ class NativeMaskState:
             self.schedule_spectrum()
         except Exception as error:
             with self.lock:
+                if (
+                    request_token != self._view_request_token
+                    or load_token != self.load_token
+                    or aggregate is not self.aggregate
+                ):
+                    return
                 self.single_loading = False
+                self.view_mode = "mean"
                 self._log(f"SINGLE BEAM ERROR: {error}", "ready", False)
             raise
 
@@ -553,50 +578,87 @@ class NativeMaskState:
         with self.lock:
             if self.aggregate is None:
                 return
-            revision = self.revision
-            document = copy.deepcopy(self.document)
-            raw_values = self.aggregate.raw_mean
-            auto_values = self.aggregate.auto_masked_mean
-            frequency = self.frequency
-            single = self.single
+            # One driver owns at most one queued/running calculation. Edits
+            # arriving meanwhile replace its next request rather than adding
+            # another full-array calculation to the data executor.
+            self._spectrum_request_token += 1
+            if self._spectrum_task is not None and not self._spectrum_task.done():
+                return
 
-        async def calculate() -> None:
-            await asyncio.sleep(0.18)
-            def calculate_all() -> tuple[dict[bool, np.ndarray], dict[bool, np.ndarray] | None]:
-                mean_result = {
-                    False: masked_time_average(raw_values, frequency, document),
-                    True: masked_time_average(auto_values, frequency, document),
-                }
-                single_result = None
-                if single is not None:
-                    single_result = {
-                        False: masked_time_average(
-                            single.raw,
-                            frequency,
-                            document,
-                            beam=single.beam,
-                        ),
-                        True: masked_time_average(
-                            single.raw,
-                            frequency,
-                            document,
-                            additional_mask=single.union_mask,
-                            beam=single.beam,
-                        ),
-                    }
-                return mean_result, single_result
+        async def calculate_latest() -> None:
+            try:
+                while True:
+                    with self.lock:
+                        token = self._spectrum_request_token
+                    await asyncio.sleep(0.18)
+                    with self.lock:
+                        if self.aggregate is None:
+                            return
+                        if token != self._spectrum_request_token:
+                            continue
+                        aggregate = self.aggregate
+                        load_token = self.load_token
+                        document = copy.deepcopy(self.document)
+                        frequency = self.frequency
+                        single = self.single
 
-            mean_result, single_result = await asyncio.get_running_loop().run_in_executor(
-                self.executor, calculate_all
-            )
-            with self.lock:
-                if revision == self.revision:
-                    self.spectra = mean_result
-                    if single is self.single and single_result is not None:
-                        self.single_spectra = single_result
-                    self.spectrum_revision += 1
+                    def calculate_all():
+                        # Loading/saving can occupy the executor during the
+                        # debounce. Skip obsolete work before touching arrays.
+                        with self.lock:
+                            if (
+                                token != self._spectrum_request_token
+                                or aggregate is not self.aggregate
+                                or load_token != self.load_token
+                            ):
+                                return None
+                        mean_result = {
+                            False: masked_time_average(aggregate.raw_mean, frequency, document),
+                            True: masked_time_average(aggregate.auto_masked_mean, frequency, document),
+                        }
+                        single_result = None
+                        if single is not None:
+                            single_result = {
+                                False: masked_time_average(
+                                    single.raw, frequency, document, beam=single.beam,
+                                ),
+                                True: masked_time_average(
+                                    single.raw, frequency, document,
+                                    additional_mask=single.union_mask, beam=single.beam,
+                                ),
+                            }
+                        return mean_result, single_result
 
-        asyncio.create_task(calculate())
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        self.executor, calculate_all
+                    )
+                    with self.lock:
+                        if self.aggregate is None:
+                            return
+                        if (
+                            result is None
+                            or token != self._spectrum_request_token
+                            or aggregate is not self.aggregate
+                            or load_token != self.load_token
+                        ):
+                            continue
+                        self.spectra, single_result = result
+                        if single is self.single and single_result is not None:
+                            self.single_spectra = single_result
+                        # Save changes the UI/status revision but not the
+                        # numerical mask content. It must not invalidate this
+                        # calculation without requesting a replacement.
+                        self.spectrum_content_revision = token
+                        self.spectrum_revision += 1
+                        return
+            except Exception as error:
+                self._log(f"SPECTRUM ERROR: {error}")
+                traceback.print_exc()
+            finally:
+                with self.lock:
+                    self._spectrum_task = None
+
+        self._spectrum_task = asyncio.create_task(calculate_latest())
 
     def spectrum_payload(
         self,
@@ -606,34 +668,50 @@ class NativeMaskState:
     ) -> dict[str, Any]:
         with self.lock:
             view_mode = str(view_mode).lower()
+            empty = np.empty((0, 2), dtype=np.float64)
+            mean = getattr(self, "spectra", {}).get(bool(apply_auto), empty)
+            mean_medians = getattr(self, "local_medians", [0.0, 0.0])
             if view_mode == "single":
                 requested_beam = str(beam or self.selected_beam).upper()
                 if self.single is None or self.single.beam != requested_beam:
-                    return {"revision": self.spectrum_revision, "apply_auto": bool(apply_auto), "view_mode": "single", "view_label": requested_beam, "frequency": [], "pol0": [], "pol1": []}
-                selected = self.single_spectra[bool(apply_auto)]
-                medians = self.single_medians
+                    selected = empty
+                    medians = [0.0, 0.0]
+                else:
+                    selected = self.single_spectra[bool(apply_auto)]
+                    medians = self.single_medians
                 view_label = requested_beam
             else:
-                selected = self.spectra[bool(apply_auto)]
-                medians = self.local_medians
+                selected = mean
+                medians = mean_medians
                 view_mode = "mean"
                 view_label = "19-beam Mean"
-            if not len(self.frequency) or not len(selected):
-                return {"revision": self.spectrum_revision, "apply_auto": bool(apply_auto), "view_mode": view_mode, "view_label": view_label, "frequency": [], "pol0": [], "pol1": []}
-            stride = max(1, len(self.frequency) // 2600)
-            frequency = self.frequency[::stride]
-            spectra = selected[::stride].copy()
-            spectra[:, 0] += medians[0]
-            spectra[:, 1] += medians[1]
-            return {
+
+            def serialized_pol(values: np.ndarray, offsets: list[float], pol: int) -> list[float | None]:
+                if not len(self.frequency) or values.shape != (len(self.frequency), 2):
+                    return []
+                restored = values[:, pol] + offsets[pol]
+                return [float(value) if np.isfinite(value) else None for value in restored]
+
+            payload = {
                 "revision": self.spectrum_revision,
+                "content_revision": getattr(self, "spectrum_content_revision", 0),
+                "group_key": self.group.key if getattr(self, "groups", None) else None,
                 "apply_auto": bool(apply_auto),
                 "view_mode": view_mode,
                 "view_label": view_label,
-                "frequency": frequency.tolist(),
-                "pol0": [float(value) if np.isfinite(value) else None for value in spectra[:, 0]],
-                "pol1": [float(value) if np.isfinite(value) else None for value in spectra[:, 1]],
+                # Keep every channel: viewport-only zoom is performed locally
+                # and must not permanently omit narrow RFI or NaN gaps.
+                "frequency": self.frequency.tolist(),
+                "pol0": serialized_pol(selected, medians, 0),
+                "pol1": serialized_pol(selected, medians, 1),
             }
+            payload["selected_ready"] = bool(payload["pol0"])
+            if view_mode == "single":
+                payload["mean_pol0"] = serialized_pol(mean, mean_medians, 0)
+                payload["mean_pol1"] = serialized_pol(mean, mean_medians, 1)
+                payload["mean_ready"] = bool(payload["mean_pol0"])
+                payload["mean_scope"] = "global_manual_only"
+            return payload
 
     def render(
         self, params: dict[str, Any]
