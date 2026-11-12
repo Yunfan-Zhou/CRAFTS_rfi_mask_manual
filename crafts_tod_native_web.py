@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from io import BytesIO
 import json
+import hashlib
 from pathlib import Path
 import threading
 import time
@@ -46,7 +47,7 @@ from crafts_tod_mask import (
 )
 
 
-APP_VERSION = "native-web-v1"
+APP_VERSION = "manual-rfi-web-1.1.0"
 DEFAULT_INPUT_DIR = Path(
     "/data71/common_storage/zhouyunfan/test_codex20260722/oldpipeline/test_all/"
     "gzn_20260831/five_stripes_current_modules_0001_0010_v2/server_data/"
@@ -215,6 +216,13 @@ def render_view_image(
 
 class NativeMaskState:
     def __init__(self, args: argparse.Namespace) -> None:
+        self.default_dir = Path(args.mask_dir).resolve()
+        self.save_root = Path(getattr(args, "save_root", None) or self.default_dir.parent).resolve()
+        self.default_dir.relative_to(self.save_root)
+        args.mask_dir = self.default_dir
+        self.disk_signature = None
+        self.last_saved = ""
+        self.profiles = {}
         self.args = args
         self.groups = discover_groups(args.input_dir)
         if not self.groups:
@@ -288,7 +296,9 @@ class NativeMaskState:
             ready = self.aggregate is not None and self.phase not in {"loading", "beam-loading", "error"}
             group = self.group
             return {
-                "version": APP_VERSION,
+                "version": APP_VERSION, "save_dir": str(self.args.mask_dir),
+                "save_root": str(self.save_root), "default_dir": str(self.default_dir),
+                "save_file": str(mask_path(self.args.mask_dir, group)), "last_saved": self.last_saved,
                 "phase": self.phase,
                 "busy": self.busy,
                 "message": self.message,
@@ -357,7 +367,7 @@ class NativeMaskState:
                 self.aggregate = aggregate
                 self.frequency = aggregate.frequency_mhz
                 self.mjd = aggregate.mjd
-                self.document = load_mask_document(mask_path(self.args.mask_dir, self.group), self.group)
+                self.document = self.read_saved(self.args.mask_dir)
                 self.document.auto_mask_files = aggregate.auto_mask_files
                 self.local_medians = []
                 for pol in (0, 1):
@@ -534,9 +544,69 @@ class NativeMaskState:
             self._log("Undid the last manual edit", "ready", False)
         self.schedule_spectrum()
 
+    def checked_targets(self, directory):
+        directory = Path(directory).resolve()
+        directory.relative_to(self.save_root)
+        paths = [mask_path(directory, self.group), *(beam_mask_path(directory, item) for item in self.group.files)]
+        for target in paths:
+            for path in (target, target.with_suffix(target.suffix + ".tmp")):
+                if path.is_symlink() or (path.exists() and not path.is_file()):
+                    raise ValueError(f"不是常规标注文件: {path}")
+                path.resolve().relative_to(self.save_root)
+        return paths
+
+    @staticmethod
+    def signature(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+    def read_saved(self, directory):
+        path, *beams = self.checked_targets(directory)
+        if not path.exists() and any(item.exists() for item in beams):
+            raise ValueError("只有 NPZ，没有记录 Mean/beam 区域的原始 JSON；请选择完整目录以免覆盖")
+        doc = load_mask_document(path, self.group)
+        self.disk_signature = self.signature(path)
+        return doc
+
+    def choose_directory(self, value):
+        text = str(value).strip()
+        dest = (self.save_root / text).resolve() if text else self.default_dir
+        if not dest.is_relative_to(self.save_root) or dest == self.save_root or (dest.exists() and not dest.is_dir()):
+            raise ValueError(f"请选择 {self.save_root} 下的标注子目录")
+        if dest == self.args.mask_dir:
+            return
+        path, *beams = self.checked_targets(dest)
+        if path.exists():
+            if self.dirty:
+                raise ValueError("目标已有标注，请先保存当前修改或恢复已保存版本")
+            doc = self.read_saved(dest)
+            doc.auto_mask_files = self.aggregate.auto_mask_files
+            self.document = doc
+            self.undo_stack.clear()
+            self.dirty = False
+        else:
+            if any(p.exists() for p in beams):
+                raise ValueError("目标仅有 NPZ，不能覆盖；请选择含标注 JSON 的目录")
+            self.disk_signature = None
+            self.dirty = True
+        self.args.mask_dir = dest
+        self.last_saved = ""
+        self.revision += 1
+        self.schedule_spectrum()
+
+    def clear_beam(self, key, beam):
+        if self.view_mode != 'single' or self.selected_beam != beam or self.group.key != key:
+            raise ValueError("beam/nfile 已改变，请重新选择")
+        self._push_undo()
+        self.document.beam_polarizations[beam] = [PolarizationMask(), PolarizationMask()]
+        self.document.done = False
+        self.dirty = True
+        self.revision += 1
+        self._log(f"已清空 {key} / {beam} 专属标注（尚未保存）", "ready", False)
+        self.schedule_spectrum()
+
     def revert(self) -> None:
         with self.lock:
-            self.document = load_mask_document(mask_path(self.args.mask_dir, self.group), self.group)
+            self.document = self.read_saved(self.args.mask_dir)
             if self.aggregate is not None:
                 self.document.auto_mask_files = self.aggregate.auto_mask_files
             self.undo_stack.clear()
@@ -549,6 +619,9 @@ class NativeMaskState:
         with self.lock:
             if self.aggregate is None:
                 raise ValueError("No loaded data")
+            target = self.checked_targets(self.args.mask_dir)[0]
+            if self.signature(target) != self.disk_signature:
+                raise ValueError("磁盘标注已更改，请重新读取后再补充")
             document = copy.deepcopy(self.document)
             document.done = True
             document.auto_mask_files = self.aggregate.auto_mask_files
@@ -560,6 +633,7 @@ class NativeMaskState:
 
         def write() -> list[Path]:
             save_mask_document(json_target, document)
+            self.disk_signature = self.signature(json_target)
             return save_beam_mask_products(self.args.mask_dir, group=group, frequency_mhz=frequency, mjd=mjd, document=document, json_path=json_target)
 
         try:
@@ -568,10 +642,13 @@ class NativeMaskState:
                 self.document = document
                 self.dirty = False
                 self.revision += 1
-                self._log(f"Saved {json_target.name} + {len(paths)} beam NPZ files", "ready", False)
+                self.last_saved = str(json_target)
+                self.disk_signature = self.signature(json_target)
+                self._log(f"Saved {json_target} + {len(paths)} beam NPZ files", "ready", False)
             return [str(json_target), *map(str, paths)]
         except Exception as error:
-            self._log(f"SAVE ERROR: {error}", "error", False)
+            self.dirty = True
+            self._log(f"SAVE ERROR: {error}; 请检查输出目录后重试", "ready", False)
             raise
 
     def schedule_spectrum(self) -> None:
@@ -613,18 +690,18 @@ class NativeMaskState:
                             ):
                                 return None
                         mean_result = {
-                            False: masked_time_average(aggregate.raw_mean, frequency, document),
-                            True: masked_time_average(aggregate.auto_masked_mean, frequency, document),
+                            False: masked_time_average(aggregate.raw_mean, frequency, document, include_profile=True),
+                            True: masked_time_average(aggregate.auto_masked_mean, frequency, document, include_profile=True),
                         }
                         single_result = None
                         if single is not None:
                             single_result = {
                                 False: masked_time_average(
-                                    single.raw, frequency, document, beam=single.beam,
+                                    single.raw, frequency, document, beam=single.beam, include_profile=True,
                                 ),
                                 True: masked_time_average(
                                     single.raw, frequency, document,
-                                    additional_mask=single.union_mask, beam=single.beam,
+                                    additional_mask=single.union_mask, beam=single.beam, include_profile=True,
                                 ),
                             }
                         return mean_result, single_result
@@ -642,9 +719,12 @@ class NativeMaskState:
                             or load_token != self.load_token
                         ):
                             continue
-                        self.spectra, single_result = result
+                        mean_result, single_result = result
+                        self.spectra = {k:v[0] for k,v in mean_result.items()}
+                        self.profiles = {("mean", k):v[1] for k,v in mean_result.items()}
                         if single is self.single and single_result is not None:
-                            self.single_spectra = single_result
+                            self.single_spectra = {k:v[0] for k,v in single_result.items()}
+                            self.profiles.update({(single.beam,k):v[1] for k,v in single_result.items()})
                         # Save changes the UI/status revision but not the
                         # numerical mask content. It must not invalidate this
                         # calculation without requesting a replacement.
@@ -686,8 +766,8 @@ class NativeMaskState:
                 view_mode = "mean"
                 view_label = "19-beam Mean"
 
-            def serialized_pol(values: np.ndarray, offsets: list[float], pol: int) -> list[float | None]:
-                if not len(self.frequency) or values.shape != (len(self.frequency), 2):
+            def serialized_pol(values: np.ndarray, offsets: list[float], pol: int, size=None) -> list[float | None]:
+                if not len(self.frequency) or values.shape != (len(self.frequency) if size is None else size, 2):
                     return []
                 restored = values[:, pol] + offsets[pol]
                 return [float(value) if np.isfinite(value) else None for value in restored]
@@ -705,6 +785,8 @@ class NativeMaskState:
                 "pol0": serialized_pol(selected, medians, 0),
                 "pol1": serialized_pol(selected, medians, 1),
             }
+            profile = getattr(self, "profiles", {}).get((view_label if view_mode == "single" else "mean", bool(apply_auto)),empty)
+            payload["time_profile"] = [serialized_pol(profile, medians, pol, len(self.mjd)) for pol in (0,1)] if len(profile) and len(selected) else [[],[]]
             payload["selected_ready"] = bool(payload["pol0"])
             if view_mode == "single":
                 payload["mean_pol0"] = serialized_pol(mean, mean_medians, 0)
@@ -829,10 +911,21 @@ class ActionHandler(BaseHandler):
     async def post(self) -> None:
         try:
             payload = json.loads(self.request.body or b"{}")
+            if self.request.headers.get("Origin") not in (None,"http://"+self.request.host) or not self.request.headers.get("Content-Type","").startswith("application/json"):
+                raise ValueError("无效的请求来源")
             action = payload.get("action")
+            if self.state.busy:
+                raise ValueError("当前正在加载或保存，请稍后重试")
             result: dict[str, Any] = {}
             if action == "edit":
                 self.state.edit(payload)
+            elif action == "directory":
+                self.state.choose_directory(payload["path"])
+            elif action == "saved_info":
+                path = self.state.checked_targets(self.state.args.mask_dir)[0]
+                result.update(path=str(path), saved=asdict(load_mask_document(path,self.state.group)) if path.is_file() else None)
+            elif action == "clear_beam":
+                self.state.clear_beam(payload["group"],payload["beam"])
             elif action == "undo":
                 self.state.undo()
             elif action == "revert":
@@ -853,6 +946,8 @@ class ActionHandler(BaseHandler):
                     index = self.state.index + 1
                 else:
                     index = int(payload["index"])
+                if self.state.dirty or not 0 <= index < len(self.state.groups):
+                    raise ValueError("有未保存标记或条目越界")
                 asyncio.create_task(self.state.load(index))
             else:
                 raise ValueError(f"Unknown action: {action!r}")
@@ -867,6 +962,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("target", nargs="?", help="nfile, group key, or SCAN:NFILE")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--mask-dir", type=Path, default=DEFAULT_MASK_DIR)
+    parser.add_argument("--save-root", type=Path, help="Allowed parent of manual mask directories")
     parser.add_argument("--one-channel-dir", type=Path)
     parser.add_argument("--sat1380-dir", type=Path)
     parser.add_argument("--require-all-auto-masks", action="store_true")

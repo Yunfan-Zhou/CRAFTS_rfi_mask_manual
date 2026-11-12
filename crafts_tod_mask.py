@@ -741,7 +741,8 @@ def masked_time_average(
     document: MaskDocument,
     additional_mask: np.ndarray | None = None,
     beam: str | None = None,
-) -> np.ndarray:
+    include_profile: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Average unmasked records for each frequency and polarization.
 
     A fully frequency-masked channel becomes NaN. Time and box masks remove only
@@ -755,6 +756,8 @@ def masked_time_average(
         raise ValueError("additional_mask must match the TOD shape")
 
     spectra = np.full((tod.shape[1], 2), np.nan, dtype=np.float64)
+    if include_profile:
+        profile = np.full((tod.shape[0], 2), np.nan)
     for polarization in (0, 1):
         values = np.asarray(tod[:, :, polarization])
         mask = build_mask(
@@ -766,6 +769,12 @@ def masked_time_average(
         count = np.sum(valid, axis=0, dtype=np.int64)
         total = np.sum(values, axis=0, dtype=np.float64, where=valid)
         np.divide(total, count, out=spectra[:, polarization], where=count > 0)
+        if include_profile:
+            counts = np.sum(valid, axis=1, dtype=np.int64)
+            totals = np.sum(values, axis=1, dtype=np.float64, where=valid)
+            np.divide(totals, counts, out=profile[:, polarization], where=counts > 0)
+    if include_profile:
+        return spectra, profile
     return spectra
 
 
