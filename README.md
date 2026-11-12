@@ -95,11 +95,12 @@ python crafts_tod_visual_mask.py 2 --input-dir /path/to/stripe \
 
 ## Controls
 
-The controls below describe both implementations. The native browser UI is the
-recommended interface; its complete workflow, Mean/Single authoring scopes,
-interactive spectrum scaling, draggable colorbar handles, save confirmation,
-and troubleshooting are documented in the
-[Chinese user guide](docs/USER_GUIDE_CN.md).
+The native browser UI (1.5) supports record and channel guide lines, vertical
+full-band time profiles, per-beam and per-file timers, and selectable save
+directories. Use `D/T/C/W` for frequency, time, box, and delete, `Q` for undo,
+and `[/]` for adjacent beams. See the [browser guide](docs/USER_GUIDE_CN.md).
+
+The following shortcuts apply to the Matplotlib interface:
 
 - `Freq` or `f`: drag a frequency interval that applies to all records.
 - `Time` or `t`: drag a record interval that applies to all frequencies.

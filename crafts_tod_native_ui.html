@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="application-version" content="manual-rfi-ui-1.5">
 <title>CRAFTS Manual RFI Mask</title>
 <style>
 :root {
@@ -72,6 +73,9 @@ input[type="range"] { accent-color: var(--accent); min-width: 90px; width: 132px
 .badge.loading, .badge.saving { background: #4a3918; color: #ffd978; }
 .group { color: var(--muted); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .spacer { flex: 1; }
+.review-timers { display:grid; gap:1px; flex:none; line-height:1.2; color:var(--muted); font-size:11px; }
+.review-timers > span { display:flex; justify-content:space-between; gap:8px; }
+.review-timers time { font-variant-numeric:tabular-nums; color:var(--text); }
 .coord { font-variant-numeric: tabular-nums; color: var(--accent); max-width: 32vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #toggleSidebar { color: var(--muted); background: transparent; }
 .layout {
@@ -110,7 +114,7 @@ input[type="range"] { accent-color: var(--accent); min-width: 90px; width: 132px
 #save { min-width: 78px; }
 .edit-controls button { padding-inline: 8px; }
 .edit-controls .check { margin-left: 5px; }
-.display-options { margin-left: auto; position: relative; }
+.display-options { margin-left: auto; position: static; }
 .display-options > summary {
   list-style: none;
   color: #b5c8dc;
@@ -253,6 +257,27 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 1.8s; } }
 
 .status{white-space:pre-line}.spectrum-legend{max-width:62%;font-size:10px;gap:8px}.spectrum-legend span{white-space:nowrap}
+.save-panel{padding:9px;border:1px solid #506172;border-radius:5px;font-size:12px;overflow-wrap:anywhere}.save-panel input{width:100%;margin:6px 0}.save-panel small{display:block;color:#9aaaba}.save-panel #lastSaved{color:#9cdbbc}#savedDialog{background:#121d28;color:white;border:1px solid #8397a6;border-radius:6px;max-width:80vw}#savedBody{max-height:50vh;overflow:auto;color:#cad9df;white-space:pre-wrap}#savedFile{overflow-wrap:anywhere}
+/* Compact control deck; keycaps and toggles use the same visual grammar. */
+.toolbar{background:#101b28;border:1px solid #304659;border-radius:8px;padding:7px 9px}
+.toolbar-row{gap:5px 8px}
+.toolbar-row + .toolbar-row{margin-top:5px}
+.toolbar kbd{display:inline-grid;place-items:center;min-width:16px;height:17px;padding:0 3px;margin-left:5px;border:1px solid #526c83;border-radius:3px;color:#c0d8e8;background:#132434;font:11px/1 ui-monospace,monospace;vertical-align:middle}
+.toolbar .auto-controls{gap:4px;padding:3px 5px;border:1px solid #39526a;border-radius:7px;background:#14202d}
+.auto-controls .check{cursor:pointer;border:1px solid #394c61;border-radius:5px;padding:4px 6px;color:#b9cad7;font-weight:600}
+.auto-controls .check:has(:checked){border-color:#50bce6;background:#153c51;color:#def4ff}
+.auto-controls .check kbd{margin-left:0}
+.auto-controls .check:focus-within{outline:2px solid var(--accent)}
+.toolbar .entry-controls{margin-left:auto;flex-wrap:nowrap;border-left:1px solid #506275;padding-left:9px}
+.toolbar .save-controls{margin-left:auto}
+.toolbar .display-options{margin-left:0}
+.toolbar .interaction-strip{margin-top:5px}
+.coord{font-weight:650}
+@media(max-width:760px){
+ .toolbar .entry-controls{margin-left:auto}
+ .toolbar .display-popover{right:0;left:auto;max-width:100%}
+ .toolbar .auto-controls{flex-wrap:wrap}
+}
 </style>
 </head>
 <body>
@@ -260,6 +285,10 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
   <div class="brand">CRAFTS Manual RFI Mask</div>
   <span id="badge" class="badge loading">starting</span>
   <div id="group" class="group">等待服务器…</div>
+  <div class="review-timers" title="累计当前标签页可见且数据就绪的时间，包含看图时间">
+    <span><span id="beamClockLabel">beam</span><time id="beamClock">—</time></span>
+    <span>nfile 总计<time id="fileClock">—</time></span>
+  </div>
   <div class="spacer"></div>
   <span class="coord" id="coord">—</span>
   <button id="toggleSidebar" type="button" aria-controls="taskSidebar" aria-expanded="true" title="展开或收起任务状态与日志">侧栏</button>
@@ -279,33 +308,31 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
             <select id="beamSelect" aria-label="选择单个 beam" hidden></select>
           </div>
         </div>
-        <div class="control-group entry-controls" aria-label="切换数据条目">
-          <button id="prev">上一个</button>
-          <button id="next">下一个</button>
-        </div>
-        <div class="control-group auto-controls" aria-label="自动 RFI 图层">
-          <label class="check"><input id="applyAuto" type="checkbox" checked>应用自动 RFI</label>
-          <label class="check"><input id="showAuto" type="checkbox" checked>显示自动 RFI</label>
+        <div class="control-group"><button id="prevBeam">上一 beam</button><button id="nextBeam">下一 beam</button></div>
+        <div class="control-group auto-controls" aria-label="显示与标记">
+          <span class="group-label">显示与标记</span>
+          <label class="check"><input id="applyAuto" type="checkbox" checked>使用自动 mask</label>
+          <label class="check"><input id="showAuto" type="checkbox" checked>显示自动标记</label>
+          <label class="check"><input id="both" type="checkbox">双偏振</label>
         </div>
         <div class="control-group save-controls">
-          <button id="save" class="primary">保存 S</button>
+          <button id="save" class="primary">保存</button>
         </div>
       </div>
       <div class="toolbar-row toolbar-secondary">
         <div class="control-group edit-controls" aria-label="标记工具">
           <span class="group-label">标记</span>
-          <button data-mode="frequency" class="active">频率 F</button>
-          <button data-mode="time">时间 T</button>
-          <button data-mode="box">矩形 B</button>
-          <button data-mode="delete">删除 D</button>
-          <button data-mode="pan">平移 G</button>
-          <label class="check"><input id="both" type="checkbox">双偏振</label>
+          <button data-mode="frequency" class="active">频率</button>
+          <button data-mode="time">时间</button>
+          <button data-mode="box">矩形</button>
+          <button data-mode="delete">删除</button>
+          <button data-mode="pan">平移</button>
         </div>
         <div class="control-group history-controls" aria-label="编辑与视图恢复">
-          <button id="undo">撤销 U</button>
-          <button id="revert">恢复已保存</button>
+          <button id="undo">撤销</button>
+          <button id="savedInfo">查看已存标注</button><button id="clearBeam">清空本 beam</button>
           <button id="viewBack" disabled title="返回上一次缩放或平移的范围，不撤销 mask">返回视图</button>
-          <button id="reset">重置视图 0</button>
+          <button id="reset">重置视图</button>
         </div>
         <details id="displayOptions" class="display-options">
           <summary>显示设置</summary>
@@ -345,6 +372,20 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
               </select>
             </div>
             <div class="display-row">
+              <label class="display-label"><input type="checkbox" id="profileOn" checked>竖向时间谱</label>
+              <button id="timeIn" type="button">时间放大 ＋</button><button id="timeOut" type="button">时间缩小 −</button>
+              <p class="display-note">点击谱线定位。鼠标放在红线上时，← → 移动一个 channel，↑ ↓ 移动一条 record。时间谱支持滚轮缩放和上下拖选。</p>
+            </div>
+            <div class="display-row">
+              <label class="display-label" for="profileRange">全频带均值 (K)</label>
+              <select id="profileRange"><option value="full">完整范围</option><option value="strong">强抗RFI</option><option value="robust">抗RFI</option><option value="percentile">99%数据</option><option value="manual">手动上下限</option></select>
+              <div id="profileManual" hidden><input id="profileMin" type="number" step="any" aria-label="均值下限 K" placeholder="下限 K" style="width:80px"> 至 <input id="profileMax" type="number" step="any" aria-label="均值上限 K" placeholder="上限 K" style="width:80px"> <button id="profileApply" type="button">应用</button></div>
+            </div>
+            <div class="display-row">
+              <label class="display-label" for="profileWidth">时间谱宽度</label>
+              <input id="profileWidth" type="range" min="72" max="360" step="2" value="102"><output id="profileWidthValue" for="profileWidth">102 px</output>
+            </div>
+            <div class="display-row">
               <label class="display-label" for="spectrumShare">频谱高度</label>
               <input id="spectrumShare" type="range" min="18" max="40" step="1" value="24" aria-describedby="spectrumShareValue">
               <output id="spectrumShareValue" for="spectrumShare">24%</output>
@@ -352,6 +393,7 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
             </div>
           </div>
         </details>
+        <div class="control-group entry-controls" aria-label="nfile 导航，无快捷键"><button id="prev">上一个 nfile</button><button id="next">下一个 nfile</button></div>
       </div>
       <div class="interaction-strip">
         <span id="modeHint">当前模式：频率标记</span>
@@ -385,6 +427,7 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
   <aside id="taskSidebar" class="side" aria-label="任务状态和日志">
     <section>
       <div class="section-heading">当前任务</div>
+      <div class="save-panel"><strong>人工标注 · 保存位置</strong><div id="saveLocation"></div><input id="dirInput" aria-label="服务器保存目录" placeholder="服务器目录或子目录名"><div><button id="applyDir">使用目录</button><button id="defaultDir">默认目录</button></div><small id="dirHint"></small><div id="lastSaved"></div></div>
       <div id="summary" class="status">连接服务器中…</div>
     </section>
     <section>
@@ -400,6 +443,7 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
     </section>
   </aside>
 </div>
+<dialog id="savedDialog"><h2>当前 nfile 的磁盘标注</h2><div id="savedFile"></div><pre id="savedBody"></pre><button id="restore">载入此标注</button><button id="closeSaved">关闭</button></dialog>
 <div id="saveConfirm" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="saveTitle" hidden>
   <div class="save-dialog">
     <h2 id="saveTitle">确认保存 manual mask</h2>
@@ -419,14 +463,19 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
 
 <script>
 'use strict';
-const $=s=>document.querySelector(s), canvases=[$('#pol0'),$('#pol1')], PAD={l:62,r:74,t:23,b:27};
+const $=s=>document.querySelector(s), canvases=[$('#pol0'),$('#pol1')], PAD={l:62,t:23,b:27};
 const IMAGE_SCALES=[.5,.75,1,1.25,1.5,2,3,4];
 const SPECTRUM_Y_LABELS={strong:'强抗RFI',robust:'抗RFI',percentile:'99%数据',full:'完整范围'};
 for(let beam=1;beam<=19;beam++){const option=document.createElement('option');option.value=`M${String(beam).padStart(2,'0')}`;option.textContent=option.value;$('#beamSelect').appendChild(option)}
 function toast(msg,error=false){const d=document.createElement('div');d.className='toast'+(error?' error':'');d.textContent=msg;document.body.appendChild(d);setTimeout(()=>d.remove(),3200)}
 function nice(v,n=3){return Number(v).toFixed(n)}
 function fitCanvas(c){const dpr=Math.min(devicePixelRatio||1,2),r=c.getBoundingClientRect(),w=Math.max(1,Math.floor(r.width*dpr)),h=Math.max(1,Math.floor(r.height*dpr));if(c.width!==w||c.height!==h){c.width=w;c.height=h}return {ctx:c.getContext('2d'),w,h,dpr}}
-function plotRect(c){const {w,h,dpr}=fitCanvas(c);return{x:PAD.l*dpr,y:PAD.t*dpr,w:w-(PAD.l+PAD.r)*dpr,h:h-(PAD.t+PAD.b)*dpr,dpr}}
+function profileWidth(cssWidth){
+  if(!$('#profileOn').checked)return 0;
+  return Math.min(Number($('#profileWidth').value),Math.max(0,Math.floor((cssWidth-PAD.l-84)*.55)));
+}
+function rightPadding(c){const width=profileWidth(c.clientWidth);return width?84+width:74}
+function plotRect(c){const {w,h,dpr}=fitCanvas(c);return{x:PAD.l*dpr,y:PAD.t*dpr,w:w-(PAD.l+rightPadding(c))*dpr,h:h-(PAD.t+PAD.b)*dpr,dpr}}
 function dataAt(c,event){const r=c.getBoundingClientRect(),p=plotRect(c),sx=c.width/r.width,sy=c.height/r.height,x=(event.clientX-r.left)*sx,y=(event.clientY-r.top)*sy;return{f:app.view.f0+(x-p.x)/p.w*(app.view.f1-app.view.f0),t:app.view.t1-(y-p.y)/p.h*(app.view.t1-app.view.t0),inside:x>=p.x&&x<=p.x+p.w&&y>=p.y&&y<=p.y+p.h,x,y}}
 function xy(c,f,t){const p=plotRect(c);return{x:p.x+(f-app.view.f0)/(app.view.f1-app.view.f0)*p.w,y:p.y+(app.view.t1-t)/(app.view.t1-app.view.t0)*p.h}}
 function drawAxes(c,ctx,p,pol){ctx.strokeStyle='#304257';ctx.lineWidth=p.dpr;ctx.strokeRect(p.x,p.y,p.w,p.h);ctx.font=`${11*p.dpr}px system-ui`;ctx.fillStyle='#90a4b9';ctx.textAlign='center';ctx.textBaseline='top';for(let i=0;i<=5;i++){const x=p.x+p.w*i/5,f=app.view.f0+(app.view.f1-app.view.f0)*i/5;ctx.beginPath();ctx.moveTo(x,p.y+p.h);ctx.lineTo(x,p.y+p.h+4*p.dpr);ctx.stroke();ctx.fillText(nice(f,1),x,p.y+p.h+6*p.dpr)}ctx.textAlign='right';ctx.textBaseline='middle';for(let i=0;i<=4;i++){const y=p.y+p.h*i/4,t=app.view.t1-(app.view.t1-app.view.t0)*i/4;ctx.fillText(String(Math.round(t)),p.x-7*p.dpr,y)}ctx.save();ctx.translate(14*p.dpr,p.y+p.h/2);ctx.rotate(-Math.PI/2);ctx.textAlign='center';ctx.fillText('Record',0,0);ctx.restore();if(pol===1){ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText('Frequency (MHz)',p.x+p.w/2,c.height-1*p.dpr)}}
@@ -440,7 +489,7 @@ function spectrumTick(v,step){const a=Math.abs(v);if(a>=10000||a>0&&a<.0001)retu
 function quantile(sorted,q){if(sorted.length===1)return sorted[0];const position=(sorted.length-1)*q,index=Math.floor(position),fraction=position-index;return sorted[index]+(sorted[Math.min(index+1,sorted.length-1)]-sorted[index])*fraction}
 function spectrumYLimits(sorted,mode){let lo,hi;if(mode==='full'){lo=sorted[0];hi=sorted[sorted.length-1]}else if(mode==='percentile'){lo=quantile(sorted,.005);hi=quantile(sorted,.995)}else{const q1=quantile(sorted,.25),q3=quantile(sorted,.75),iqr=q3-q1,strong=mode==='strong',fence=strong?1.5:2.5,tail=strong?.02:.01;lo=Math.max(quantile(sorted,tail),q1-fence*iqr);hi=Math.min(quantile(sorted,1-tail),q3+fence*iqr)}if(!(hi>lo)){const centre=Number.isFinite(lo)?lo:0,span=Math.max(1,Math.abs(centre)*.05);return[centre-span,centre+span]}const margin=(hi-lo)*.08;return[lo-margin,hi+margin]}
 function drawSpectrumAxis(ctx,p,h,lo=null,hi=null){ctx.strokeStyle='#304257';ctx.lineWidth=p.dpr;ctx.strokeRect(p.x,p.y,p.w,p.h);ctx.font=`${11*p.dpr}px system-ui`;ctx.fillStyle='#91a3b7';ctx.textAlign='center';ctx.textBaseline='top';for(let i=0;i<=5;i++){const x=p.x+p.w*i/5,f=app.view.f0+(app.view.f1-app.view.f0)*i/5;ctx.beginPath();ctx.moveTo(x,p.y);ctx.lineTo(x,p.y+p.h);ctx.strokeStyle=i===0||i===5?'#304257':'#1b2837';ctx.stroke();ctx.fillText(nice(f,1),x,p.y+p.h+5*p.dpr)}if(lo!==null&&hi!==null){ctx.textAlign='right';ctx.textBaseline='middle';for(let i=0;i<=4;i++){const y=p.y+p.h*i/4,v=hi-(hi-lo)*i/4;ctx.fillText(spectrumTick(v,(hi-lo)/4),p.x-7*p.dpr,y)}ctx.save();ctx.translate(13*p.dpr,p.y+p.h/2);ctx.rotate(-Math.PI/2);ctx.textAlign='center';ctx.fillText('Mean (K)',0,0);ctx.restore()}ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText('Frequency (MHz)',p.x+p.w/2,h-1*p.dpr)}
-const app={state:null,mode:'frequency',contrast:0,autoWidth:1,imageScaleIndex:2,spectrumYMode:'strong',view:null,drag:null,colorDrag:null,colorRanges:[null,null],autoLimits:[[0,1],[0,1]],renderSeq:0,spectrumRevision:-1,images:[null,null],imageViews:[null,null],imageKeys:[null,null],imageQuality:[null,null],limits:[[0,1],[0,1]],spectrumData:null,meanSpectrum:null,referenceFrequency:null,dataEpoch:0,history:[],framePending:false,renderPending:false,renderRunning:false,renderTimer:null,settleTimer:null,renderQuality:'final',lastRenderStart:0,controllers:[],wheelActive:false,scopePending:false,scopeRequest:0,spectrumRequest:0,spectrumInFlight:false,spectrumPending:false,spectrumKey:null,sidebarUserChoice:false};
+const app={state:null,mode:'frequency',contrast:0,autoWidth:1,imageScaleIndex:2,spectrumYMode:'strong',view:null,drag:null,colorDrag:null,colorRanges:[null,null],autoLimits:[[0,1],[0,1]],renderSeq:0,spectrumRevision:-1,images:[null,null],imageViews:[null,null],imageKeys:[null,null],imageQuality:[null,null],limits:[[0,1],[0,1]],spectrumData:null,meanSpectrum:null,referenceFrequency:null,referenceRecord:null,profileDrag:null,profileLimits:null,dataEpoch:0,history:[],framePending:false,renderPending:false,renderRunning:false,renderTimer:null,settleTimer:null,renderQuality:'final',lastRenderStart:0,controllers:[],wheelActive:false,scopePending:false,scopeRequest:0,spectrumRequest:0,spectrumInFlight:false,spectrumPending:false,spectrumKey:null,sidebarUserChoice:false};
 
 function sameView(a,b){return Boolean(a&&b&&['f0','f1','t0','t1'].every(k=>Math.abs(a[k]-b[k])<1e-9))}
 function constrainView(view,state){
@@ -526,6 +575,88 @@ function drawManual(c,ctx,p,pol){
   }
   ctx.restore();
 }
+// The view spans record bin edges [t0,t1]; sample i is drawn at i+0.5.
+function profileRect(p,c){
+  return {x:p.x+p.w+75*p.dpr,y:p.y,w:profileWidth(c.clientWidth)*p.dpr,h:p.h};
+}
+function profileValues(pol){
+  const d=app.spectrumData,s=app.state;
+  return d?.group_key===s.group.key&&d.view_mode===s.view_mode&&d.apply_auto===$('#applyAuto').checked&&(s.view_mode!=='single'||d.view_label===s.selected_beam)?d.time_profile?.[pol]:null;
+}
+function profileAt(c,d){
+  const r=profileRect(plotRect(c),c);
+  return r.w>0&&d.x>=r.x&&d.x<=r.x+r.w&&d.y>=r.y&&d.y<=r.y+r.h;
+}
+function recordAt(t){return Math.max(0,Math.min(app.state.shape[0]-1,Math.floor(t)))}
+function recordY(p,t){return p.y+p.h*(app.view.t1-t)/(app.view.t1-app.view.t0)}
+function profileReadout(t,pol){
+  const i=recordAt(t),v=profileValues(pol)?.[i];
+  return 'record '+i+' · Pol'+pol+' 全频带均值 '+(Number.isFinite(v)?nice(v,4)+' K':'无有效值');
+}
+function drawRecordGuide(ctx,p,r){
+  const row=app.referenceRecord;
+  if(row===null||row+.5<app.view.t0||row+.5>app.view.t1)return;
+  const y=recordY(p,row+.5),k=p.dpr;
+  ctx.save();ctx.beginPath();ctx.strokeStyle='#ff334f';ctx.lineWidth=1.4*k;ctx.setLineDash([6*k,4*k]);
+  ctx.moveTo(p.x,y);ctx.lineTo(p.x+p.w,y);
+  if(r.w){ctx.moveTo(r.x,y);ctx.lineTo(r.x+r.w,y)}ctx.stroke();
+  ctx.font=(11*k)+'px system-ui';ctx.textAlign='left';ctx.textBaseline='middle';
+  const label='record '+row,ly=Math.max(p.y+8*k,Math.min(y-9*k,p.y+p.h-8*k));
+  ctx.fillStyle='#9c1830';ctx.fillRect(p.x+2*k,ly-7*k,ctx.measureText(label).width+8*k,14*k);
+  ctx.fillStyle='#fff';ctx.fillText(label,p.x+6*k,ly);
+  if(r.w){
+    const labelWidth=Math.min(r.w,ctx.measureText(label).width+8*k);
+    ctx.fillStyle='#9c1830';ctx.fillRect(r.x,ly-7*k,labelWidth,14*k);
+    ctx.fillStyle='#fff';ctx.fillText(label,r.x+4*k,ly,labelWidth-6*k);
+  }
+  ctx.restore();
+}
+function drawTimeProfile(ctx,p,pol){
+  const r=profileRect(p,canvases[pol]);if(!r.w)return;
+  const {x,y,w,h}=r,k=p.dpr,values=profileValues(pol);
+  const first=Math.max(0,Math.ceil(app.view.t0-.5)),end=Math.min(values?.length||0,Math.ceil(app.view.t1-.5));
+  const mode=$('#profileRange').value;
+  const sorted=values?values.slice(first,end).filter(Number.isFinite).sort((a,b)=>a-b):[];
+  const limits=(mode==='manual'&&app.profileLimits)||(sorted.length?spectrumYLimits(sorted,mode==='manual'?'full':mode):null);
+  ctx.save();ctx.font=(10*k)+'px system-ui';ctx.fillStyle='#b1c6d4';ctx.textAlign='center';ctx.textBaseline='alphabetic';ctx.fillText('全频带均值 (K)',x+w/2,y-13*k,w);
+  const recordRange='record '+recordAt(app.view.t0)+'–'+recordAt(Math.ceil(app.view.t1)-1);
+  ctx.fillText(recordRange,x+w/2,y-2*k,w);
+  ctx.strokeStyle='#425263';ctx.strokeRect(x,y,w,h);
+  if(limits){
+    const [lo,hi]=limits;ctx.textAlign='left';ctx.fillText(spectrumTick(lo,(hi-lo)/8),x,y+h+14*k);ctx.textAlign='right';ctx.fillText(spectrumTick(hi,(hi-lo)/8),x+w,y+h+14*k);
+    ctx.save();ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();ctx.beginPath();let line=false;
+    for(let i=first;i<end;i++){const v=values[i];if(!Number.isFinite(v)){line=false;continue}const xx=x+w*(v-lo)/(hi-lo),yy=recordY(p,i+.5);if(line)ctx.lineTo(xx,yy);else {ctx.moveTo(xx,yy);ctx.lineTo(xx+.01*k,yy)}line=true}
+    ctx.lineCap='round';ctx.strokeStyle=pol?'#ffa865':'#75d9f3';ctx.stroke();ctx.restore();
+  }
+  const drag=app.profileDrag;
+  if(drag&&drag.pol===pol){const a=recordY(p,drag.start.t),b=recordY(p,drag.now.t);ctx.fillStyle='#57c7ff33';ctx.fillRect(x,Math.min(a,b),w,Math.abs(a-b))}
+  ctx.restore();
+}
+function profileZoom(factor,anchor,fromWheel=false){
+  if(!app.state?.ready||!app.view||app.scopePending||app.state.busy)return;
+  const v=app.view,t=app.referenceRecord===null?NaN:app.referenceRecord+.5;
+  const next=zoomAt(v,'time',anchor??(t>=v.t0&&t<=v.t1?t:(v.t0+v.t1)/2),factor,app.state);
+  if(sameView(v,next))return;
+  if(!fromWheel||!app.wheelActive)rememberView();
+  if(fromWheel)app.wheelActive=true;
+  app.view=next;navigationChanged(!fromWheel);
+}
+$('#profileOn').onchange=()=>{app.profileDrag=null;if(app.state?.ready)navigationChanged(true)};
+$('#timeIn').onclick=()=>profileZoom(.5);
+$('#timeOut').onclick=()=>profileZoom(2);
+$('#profileRange').onchange=()=>{
+  const manual=$('#profileRange').value==='manual';$('#profileManual').hidden=!manual;
+  if(manual&&!app.profileLimits){
+    const v=app.view,values=v?[0,1].flatMap(pol=>(profileValues(pol)||[]).slice(Math.floor(v.t0),Math.ceil(v.t1))).filter(Number.isFinite).sort((a,b)=>a-b):[];
+    if(values.length){app.profileLimits=spectrumYLimits(values,'full');[$('#profileMin').value,$('#profileMax').value]=app.profileLimits}
+  }
+  requestLocalDraw();
+};
+$('#profileApply').onclick=()=>{
+  const lo=$('#profileMin').valueAsNumber,hi=$('#profileMax').valueAsNumber;
+  if(!Number.isFinite(lo)||!Number.isFinite(hi)||hi<=lo){toast('请输入有限的 K 值，且上限须大于下限。',true);return}
+  app.profileLimits=[lo,hi];requestLocalDraw();
+};
 function drawPanel(pol){
   const c=canvases[pol],{ctx}=fitCanvas(c),p=plotRect(c);
   ctx.fillStyle='#090e14';ctx.fillRect(0,0,c.width,c.height);ctx.imageSmoothingEnabled=false;
@@ -533,7 +664,7 @@ function drawPanel(pol){
     const d=imageDestination(app.imageViews[pol],app.view,p);
     ctx.save();ctx.beginPath();ctx.rect(p.x,p.y,p.w,p.h);ctx.clip();ctx.drawImage(app.images[pol],d.x,d.y,d.w,d.h);ctx.restore();
   }
-  drawAxes(c,ctx,p,pol);drawColorbar(ctx,p,pol);drawManual(c,ctx,p,pol);drawReference(ctx,p,true);
+  drawAxes(c,ctx,p,pol);drawTimeProfile(ctx,p,pol);drawColorbar(ctx,p,pol);drawManual(c,ctx,p,pol);drawReference(ctx,p,true);drawRecordGuide(ctx,p,profileRect(p,c));
 }
 function redrawOverlays(){canvases.forEach((_,pol)=>drawPanel(pol))}
 async function renderPanel(pol,job){
@@ -572,6 +703,7 @@ async function flushRenderQueue(){
   finally{app.renderRunning=false;app.controllers=[];updateViewStatus();if(app.renderPending)renderAll({interactive:app.renderQuality==='preview'})}
 }
 function navigationChanged(final=false){
+  hoveredGuide=null;
   requestLocalDraw();updateViewStatus();clearTimeout(app.settleTimer);
   renderAll({interactive:!final});
   if(!final)app.settleTimer=setTimeout(()=>{app.wheelActive=false;renderAll()},180);
@@ -596,7 +728,7 @@ function spectrumPoints(frequency,values,view,bins){
 }
 function drawSpectrum(data){
   app.spectrumData=data;
-  const c=$('#spectrum'),{ctx,w,h,dpr}=fitCanvas(c),p={x:PAD.l*dpr,y:23*dpr,w:w-(PAD.l+PAD.r)*dpr,h:h-51*dpr,dpr};
+  const c=$('#spectrum'),{ctx,w,h,dpr}=fitCanvas(c),p={x:PAD.l*dpr,y:23*dpr,w:w-(PAD.l+rightPadding(c))*dpr,h:h-51*dpr,dpr};
   ctx.fillStyle='#090e14';ctx.fillRect(0,0,w,h);
   const single=$('#viewMode').value==='single';
   const matchingGroup=data.group_key===app.state.group.key;
@@ -651,16 +783,63 @@ async function pollSpectrum(force=false){
     const d=await response.json();
     if(seq!==app.spectrumRequest||app.scopePending||group!==app.state.group.key||d.group_key!==group||requested!==$('#applyAuto').checked||d.view_mode!==app.state.view_mode||(viewMode==='single'&&d.view_label!==app.state.selected_beam))return;
     if(viewMode==='mean'&&d.pol0.length)app.meanSpectrum=d;
-    if(d.mean_pol0?.length)app.meanSpectrum={...d,view_mode:'mean',view_label:'19-beam Mean',pol0:d.mean_pol0,pol1:d.mean_pol1};
+    if(d.mean_pol0?.length)app.meanSpectrum={...d,time_profile:null,view_mode:'mean',view_label:'19-beam Mean',pol0:d.mean_pol0,pol1:d.mean_pol1};
     app.spectrumKey=key;app.spectrumRevision=d.revision;drawSpectrum(d);
   }catch(error){updateViewStatus('频谱更新失败，稍后重试');app.spectrumKey=null}
   finally{app.spectrumInFlight=false;if(app.spectrumPending){app.spectrumPending=false;pollSpectrum()}}
 }
+// Store durations per tab. A monotonic clock measures the visible review interval.
+const timerStorageKey='crafts.reviewTimers.v1';
+let reviewTime={file:null,beam:null,fileMs:0,beamMs:0};
+try {
+  const saved=JSON.parse(sessionStorage.getItem(timerStorageKey));
+  if(saved && typeof saved.file==='string' && [saved.fileMs,saved.beamMs].every(ms=>Number.isFinite(ms)&&ms>=0))reviewTime=saved;
+} catch {}
+let reviewStarted=null;
+let timerState=null;
+function durationLabel(ms){
+  const seconds=Math.floor(ms/1000);
+  return [Math.floor(seconds/3600),Math.floor(seconds/60)%60,seconds%60]
+    .map(n=>String(n).padStart(2,'0')).join(':');
+}
+function drawReviewTimers(){
+  if(!timerState)return;
+  const elapsed=reviewStarted===null?0:performance.now()-reviewStarted;
+  $('#beamClockLabel').textContent=reviewTime.beam||'Mean';
+  $('#beamClock').textContent=reviewTime.beam?durationLabel(reviewTime.beamMs+elapsed):'—';
+  $('#fileClock').textContent=durationLabel(reviewTime.fileMs+elapsed);
+}
+function syncReviewTimers(state){
+  const now=performance.now();
+  if(reviewStarted!==null){
+    const elapsed=now-reviewStarted;
+    reviewTime.fileMs+=elapsed;
+    if(reviewTime.beam)reviewTime.beamMs+=elapsed;
+  }
+  reviewStarted=null;
+  timerState=state;
+  if(state?.group){
+    const file=JSON.stringify([state.default_dir,state.group.key]);
+    const beam=state.view_mode==='single'?state.selected_beam:null;
+    if(file!==reviewTime.file)reviewTime={file,beam,fileMs:0,beamMs:0};
+    if(beam!==reviewTime.beam){reviewTime.beam=beam;reviewTime.beamMs=0}
+    if(state.ready&&!state.busy&&!document.hidden&&!app.scopePending)reviewStarted=now;
+  }
+  if(reviewTime.file){
+    try { sessionStorage.setItem(timerStorageKey,JSON.stringify(reviewTime)) } catch {}
+  }
+  drawReviewTimers();
+}
+document.addEventListener('visibilitychange',()=>syncReviewTimers(timerState));
+addEventListener('pagehide',()=>syncReviewTimers(null));
+addEventListener('pageshow',()=>syncReviewTimers(app.state));
+setInterval(drawReviewTimers,500);
 function applyState(s,initial=false){
   if(app.scopePending)return;
   const prior=app.state,newGroup=!prior||prior.group.key!==s.group.key;
   const newScope=newGroup||prior.view_mode!==s.view_mode||prior.selected_beam!==s.selected_beam;
   app.state=s;
+  syncReviewTimers(s);
   $('#badge').textContent=s.phase;$('#badge').className='badge '+s.phase;
   $('#group').textContent=`${s.group.scan}:${s.group.serial} · ${s.group.beams.length}/19 beams · ${s.dirty?'未保存':'已保存/未修改'}`;
   $('#viewMode').value=s.view_mode||'mean';$('#beamSelect').hidden=s.view_mode!=='single';if(s.selected_beam)$('#beamSelect').value=s.selected_beam;
@@ -672,15 +851,22 @@ function applyState(s,initial=false){
   if(log.textContent!==nextLog){const follow=log.scrollHeight-log.scrollTop-log.clientHeight<45;log.textContent=nextLog;if(follow)log.scrollTop=log.scrollHeight}
   document.querySelectorAll('.loading-cover').forEach(cover=>cover.hidden=s.ready);
   document.querySelectorAll('.toolbar button,.toolbar select,.toolbar input').forEach(b=>b.disabled=s.busy&&b.id!=='spectrumShare');
+  const beams=s.group.beams,idx=beams.indexOf(s.selected_beam),single=s.view_mode==='single';
+  $('#prevBeam').disabled=s.busy||single&&idx<=0;$('#nextBeam').disabled=s.busy||single&&idx>=beams.length-1;
+  $('#prev').disabled=s.busy||s.dirty||s.index===0;$('#next').disabled=s.busy||s.dirty||s.index===s.group_count-1;
+  $('#clearBeam').disabled=s.busy||!single;$('#applyDir').disabled=$('#defaultDir').disabled=s.busy;
+  $('#saveLocation').textContent=s.save_file;$('#dirHint').textContent='可选根目录：'+s.save_root;
+  $('#lastSaved').textContent=s.last_saved?'保存成功：'+s.last_saved:'';
+  if(!prior||prior.save_dir!==s.save_dir)$('#dirInput').value=s.save_dir;
   $('#viewBack').disabled=s.busy||!app.history.length;
-  if(newGroup){invalidateImages();app.meanSpectrum=null;app.spectrumData=null;app.spectrumKey=null;app.history=[];app.referenceFrequency=null;app.view=null}
+  if(newGroup){invalidateImages();app.meanSpectrum=null;app.spectrumData=null;app.spectrumKey=null;app.history=[];app.referenceFrequency=null;app.referenceRecord=null;app.profileDrag=null;app.view=null;hoveredGuide=null}
   else if(newScope){invalidateImages();app.spectrumKey=null}
   if(s.ready&&(!app.view||initial))app.view={f0:s.frequency_range[0],f1:s.frequency_range[1],t0:0,t1:s.shape[0]};
   if(s.ready&&(newScope||!prior?.ready||initial))renderAll();
   if(s.ready){requestLocalDraw();pollSpectrum();updateViewStatus()}
 }
 async function poll(){
-  try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw Error(response.statusText);const s=await response.json();applyState(s,!app.state)}catch(error){$('#badge').textContent='disconnected'}
+  try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw Error(response.statusText);const s=await response.json();applyState(s,!app.state)}catch(error){syncReviewTimers(null);$('#badge').textContent='disconnected'}
   setTimeout(poll,700);
 }
 async function action(payload,{apply=true}={}){
@@ -698,7 +884,7 @@ function setMode(mode){
 document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{setMode(b.dataset.mode);$('#displayOptions').open=false});
 async function changeDataView(){
   const seq=++app.scopeRequest,viewMode=$('#viewMode').value,beam=$('#beamSelect').value;
-  app.scopePending=true;invalidateImages();app.spectrumRequest++;app.spectrumKey=null;app.colorRanges=[null,null];
+  app.scopePending=true;syncReviewTimers(null);invalidateImages();app.spectrumRequest++;app.spectrumKey=null;app.colorRanges=[null,null];
   $('#beamSelect').hidden=viewMode!=='single';$('#viewMode').disabled=true;$('#beamSelect').disabled=true;
   document.querySelectorAll('.loading-cover').forEach(cover=>cover.hidden=false);
   if(app.meanSpectrum)drawSpectrum(viewMode==='mean'?app.meanSpectrum:{...app.meanSpectrum,view_mode:'single',pol0:[],pol1:[],mean_pol0:app.meanSpectrum.pol0,mean_pol1:app.meanSpectrum.pol1});
@@ -706,9 +892,17 @@ async function changeDataView(){
   catch(error){if(seq===app.scopeRequest){app.scopePending=false;const response=await fetch('/api/state');applyState(await response.json())}}
 }
 $('#viewMode').onchange=changeDataView;$('#beamSelect').onchange=changeDataView;
-for(const[id,act]of[['undo','undo'],['revert','revert'],['prev','previous'],['next','next']])$('#'+id).onclick=()=>action({action:act}).catch(()=>{});
+for(const[id,act]of[['undo','undo'],['prev','previous'],['next','next']])$('#'+id).onclick=()=>action({action:act}).catch(()=>{});
+function stepBeam(step){if(!app.state?.ready||app.scopePending)return;const s=app.state,beams=s.group.beams;const i=s.view_mode==='mean'?(step>0?0:beams.length-1):beams.indexOf(s.selected_beam)+step;if(i<0||i>=beams.length)return;$('#beamSelect').value=beams[i];$('#viewMode').value='single';changeDataView()}
+$('#prevBeam').onclick=()=>stepBeam(-1);$('#nextBeam').onclick=()=>stepBeam(1);
+$('#applyDir').onclick=()=>action({action:'directory',path:$('#dirInput').value}).catch(()=>{});
+$('#defaultDir').onclick=()=>action({action:'directory',path:app.state.default_dir}).catch(()=>{});
+$('#clearBeam').onclick=()=>{const s=app.state;if(confirm('清空 '+s.group.serial+' / '+s.selected_beam+' 两个偏振的专属标注？公共层保留，确认保存前可撤销。'))action({action:'clear_beam',group:s.group.key,beam:s.selected_beam}).catch(()=>{})};
+$('#savedInfo').onclick=async()=>{try{const d=await action({action:'saved_info'});$('#savedFile').textContent=d.path;$('#savedBody').textContent=d.saved?Object.entries({Mean:d.saved.polarizations,...d.saved.beam_polarizations}).flatMap(([name,pols])=>pols.flatMap((v,i)=>{const rows=[...(v.frequency_ranges_mhz||[]).map(r=>'频率 '+r.join(' – ')+' MHz'),...(v.time_ranges_records||[]).map(r=>'记录 '+r.join(' – ')),...(v.boxes||[]).map(b=>'频率 '+b.frequency_mhz.join(' – ')+' MHz；记录 '+b.records.join(' – '))];return rows.length?[name+' · Pol'+i,...rows.map(x=>'  '+x)]:[]})).join('\n')||'已保存，未标记任何区域。':'当前目录尚无本 nfile 的标注 JSON。';$('#restore').textContent=d.saved?'载入此标注':'恢复为空标注';$('#savedDialog').showModal()}catch{}};
+$('#restore').onclick=async()=>{if(app.state.dirty&&!confirm('丢弃本 nfile 尚未保存的修改，恢复磁盘版本？'))return;try{await action({action:'revert'});$('#savedDialog').close()}catch{}};
+$('#closeSaved').onclick=()=>$('#savedDialog').close();
 function appendSaveRow(label,counts){const row=document.createElement('tr');for(const value of[label,counts.pol0,counts.pol1,counts.total]){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)}$('#saveRows').appendChild(row)}
-function showSaveConfirmation(summary){$('#saveRows').replaceChildren();appendSaveRow('Mean 公共层',summary.mean);for(const[beam,counts]of Object.entries(summary.beams))appendSaveRow(`${beam} 专属层`,counts);$('#saveExplanation').textContent=`nfile ${app.state.group.serial} 将生成 19 个逐-beam NPZ；每个最终 mask = Mean 公共层 ∪ 对应 beam 专属层。以下为归一化后的有效区域数，请确认。`;$('#saveConfirm').hidden=false;$('#confirmSave').focus()}
+function showSaveConfirmation(summary){$('#saveRows').replaceChildren();appendSaveRow('Mean 公共层',summary.mean);for(const[beam,counts]of Object.entries(summary.beams))appendSaveRow(`${beam} 专属层`,counts);$('#saveExplanation').textContent=`nfile ${app.state.group.serial} 保存到 ${app.state.save_file}，并更新同目录 19 个逐-beam NPZ；每个最终 mask = Mean 公共层 ∪ 对应 beam 专属层。以下为归一化后的有效区域数，请确认。`;$('#saveConfirm').hidden=false;$('#confirmSave').focus()}
 $('#save').onclick=async()=>{try{const d=await action({action:'save_summary'});showSaveConfirmation(d.summary)}catch{}};
 function closeSaveConfirmation(){if(app.state?.busy)return;$('#saveConfirm').hidden=true;$('#save').focus()}
 $('#cancelSave').onclick=closeSaveConfirmation;
@@ -744,6 +938,7 @@ canvases.forEach((c,pol)=>{
   c.addEventListener('pointerdown',e=>{
     if(e.button!==0||!app.state?.ready||app.state.busy||app.scopePending||!$('#saveConfirm').hidden)return;
     const kind=gestureKind(e,app.mode),d=dataAt(c,e);
+    if(profileAt(c,d)){e.preventDefault();c.focus({preventScroll:true});c.setPointerCapture(e.pointerId);app.profileDrag={pol,id:e.pointerId,start:d,now:d};return}
     if(!e.altKey&&!e.shiftKey){const hit=colorbarHit(c,e,pol);if(hit){c.setPointerCapture(e.pointerId);app.colorRanges[pol]=[...(app.colorRanges[pol]||app.limits[pol])];app.colorDrag={pol,handle:hit.handle,base:hit.base};updateColorDrag(c,e,pol);return}}
     if(!d.inside)return;
     if(!kind.startsWith('zoom-')&&kind!=='pan'&&!viewIsClear()){toast('正在更新清晰视图，请稍候再标记。');return}
@@ -753,9 +948,14 @@ canvases.forEach((c,pol)=>{
   c.addEventListener('pointermove',e=>{
     if(updateColorDrag(c,e,pol))return;
     if(!app.state?.ready||!app.view)return;
-    const d=dataAt(c,e),kind=gestureKind(e,app.mode);
+    const d=dataAt(c,e),kind=gestureKind(e,app.mode),pd=app.profileDrag;
+    if(pd&&pd.pol===pol&&pd.id===e.pointerId){pd.now={...d,t:Math.max(app.view.t0,Math.min(app.view.t1,d.t))};$('#coord').textContent=profileReadout(pd.now.t,pol);requestLocalDraw();return}
+    if(!app.drag&&profileAt(c,d)){c.style.cursor='crosshair';$('#coord').textContent=profileReadout(d.t,pol);return}
     c.style.cursor=colorbarHit(c,e,pol)?'ns-resize':kind==='zoom-frequency'?'ew-resize':kind==='zoom-time'?'ns-resize':kind==='pan'?'grab':'crosshair';
-    if(d.inside)$('#coord').textContent=`${nice(d.f,4)} MHz · record ${Math.round(d.t)}`;
+    if(d.inside){
+      const state=app.state,origin=state.frequency_range[0],step=Math.abs(state.frequency_step_mhz),ch=Math.max(0,Math.min(state.shape[1]-1,Math.round((d.f-origin)/step)));
+      $('#coord').textContent=`${state.view_mode==='mean'?'Mean':state.selected_beam} · Pol ${pol} · ch ${ch} · ${nice(origin+ch*step,4)} MHz · record ${recordAt(d.t)}`;
+    }
     if(!app.drag||app.drag.pol!==pol||app.drag.pointerId!==e.pointerId)return;
     app.drag.now=d;
     if(app.drag.kind==='pan'){
@@ -765,6 +965,13 @@ canvases.forEach((c,pol)=>{
     }else requestLocalDraw();
   });
   c.addEventListener('pointerup',async e=>{
+    const pd=app.profileDrag;
+    if(pd&&pd.pol===pol&&pd.id===e.pointerId){
+      app.profileDrag=null;const d=dataAt(c,e),t=Math.max(app.view.t0,Math.min(app.view.t1,d.t));
+      if(Math.abs(d.y-pd.start.y)>3*plotRect(c).dpr){
+        rememberView();app.view=rangeZoomView(app.view,'zoom-time',{t:Math.floor(Math.min(t,pd.start.t))},{t:Math.ceil(Math.max(t,pd.start.t))},app.state);navigationChanged(true);
+      }else{app.referenceRecord=recordAt(t);$('#coord').textContent=profileReadout(t,pol);requestLocalDraw()}return;
+    }
     if(app.colorDrag?.pol===pol){updateColorDrag(c,e,pol);app.colorDrag=null;renderAll();return}
     if(!app.drag||app.drag.pol!==pol||app.drag.pointerId!==e.pointerId)return;
     const drag=app.drag,d=dataAt(c,e),p=plotRect(c);app.drag=null;
@@ -777,15 +984,70 @@ canvases.forEach((c,pol)=>{
     if(dx<threshold||dy<threshold){requestLocalDraw();return}
     try{await action({action:'edit',mode:drag.kind,pol,both:$('#both').checked,f0:drag.start.f,f1:d.f,t0:drag.start.t,t1:d.t})}catch{}
   });
-  c.addEventListener('pointercancel',()=>{app.drag=null;app.colorDrag=null;navigationChanged(true)});
-  c.addEventListener('wheel',e=>handleWheel(c,e),{passive:false});
+  c.addEventListener('pointercancel',()=>{app.drag=null;app.profileDrag=null;app.colorDrag=null;navigationChanged(true)});
+  c.addEventListener('wheel',e=>{
+    if(!app.view||app.profileDrag||app.drag||app.colorDrag)return;
+    const d=dataAt(c,e);
+    if(profileAt(c,d)){e.preventDefault();profileZoom(wheelScale(e,c.clientHeight),d.t,true)}else handleWheel(c,e);
+  },{passive:false});
 });
 $('#spectrum').addEventListener('mousemove',e=>{if(!app.state?.ready)return;const d=dataAt($('#spectrum'),e);if(d.inside)$('#coord').textContent=`${nice(d.f,4)} MHz · mean spectrum`});
 $('#spectrum').addEventListener('click',e=>{
   if(!app.state?.ready)return;const d=dataAt($('#spectrum'),e);if(!d.inside)return;
-  const origin=app.state.frequency_range[0],step=Math.abs(app.state.frequency_step_mhz||((app.state.frequency_range[1]-origin)/(app.state.shape[1]-1))),index=Math.max(0,Math.min(app.state.shape[1]-1,Math.round((d.f-origin)/step)));
-  app.referenceFrequency=origin+index*step;$('#coord').textContent=`参考 channel ${index} · ${nice(app.referenceFrequency,4)} MHz`;requestLocalDraw();
+  selectGuideChannel(channelAt(d.f));requestLocalDraw();
 });
+function channelStep(){
+  const [lo,hi]=app.state.frequency_range;
+  return Math.abs(app.state.frequency_step_mhz)||(hi-lo)/Math.max(1,app.state.shape[1]-1)||1;
+}
+function channelAt(frequency){
+  return Math.round((frequency-app.state.frequency_range[0])/channelStep());
+}
+function selectGuideChannel(index){
+  const channel=Math.max(0,Math.min(app.state.shape[1]-1,index));
+  app.referenceFrequency=app.state.frequency_range[0]+channel*channelStep();
+  $('#coord').textContent=`参考 channel ${channel} · ${nice(app.referenceFrequency,4)} MHz`;
+}
+let hoveredGuide=null;
+function findGuide(canvas,event){
+  hoveredGuide=null;
+  if(!app.view||!app.state?.ready)return;
+  const point=dataAt(canvas,event),p=plotRect(canvas),pol=canvases.indexOf(canvas);
+  const overProfile=pol>=0&&profileAt(canvas,point);
+  if(!point.inside&&!overProfile)return;
+  const tolerance=7*p.dpr,view=app.view;
+  const f=app.referenceFrequency,row=app.referenceRecord;
+  const nearFrequency=point.inside && f!==null && f>=view.f0 && f<=view.f1 &&
+    Math.abs(point.f-f)*p.w/(view.f1-view.f0)<=tolerance;
+  const nearRecord=pol>=0 && row!==null && row+.5>=view.t0 && row+.5<=view.t1 &&
+    Math.abs(recordY(p,row+.5)-point.y)<=tolerance;
+  if(nearFrequency||nearRecord)hoveredGuide={nearFrequency,nearRecord,pol};
+}
+// Keep the hovered guide selected across repeated key presses until the pointer moves.
+for(const canvas of [...canvases,$('#spectrum')]){
+  for(const event of ['pointermove','click']){
+    canvas.addEventListener(event,e=>findGuide(canvas,e));
+  }
+  canvas.addEventListener('pointerleave',()=>{hoveredGuide=null});
+}
+function moveHoveredGuide(key){
+  const guide=hoveredGuide;
+  if(!guide)return false;
+  const view=app.view;
+  if(guide.nearFrequency && (key==='ArrowLeft'||key==='ArrowRight')){
+    const next=channelAt(app.referenceFrequency)+(key==='ArrowRight'?1:-1);
+    const frequency=app.state.frequency_range[0]+next*channelStep();
+    if(frequency>=view.f0&&frequency<=view.f1)selectGuideChannel(next);
+  }else if(guide.nearRecord && (key==='ArrowUp'||key==='ArrowDown')){
+    const next=app.referenceRecord+(key==='ArrowUp'?1:-1);
+    if(next>=0&&next<app.state.shape[0]&&next+.5>=view.t0&&next+.5<=view.t1){
+      app.referenceRecord=next;
+      $('#coord').textContent=profileReadout(next+.5,guide.pol);
+    }
+  }else{return false}
+  requestLocalDraw();
+  return true;
+}
 $('#spectrum').addEventListener('wheel',e=>{if(e.altKey&&!e.shiftKey)handleWheel($('#spectrum'),e)},{passive:false});
 function clampView(){app.view=constrainView(app.view,app.state)}
 function storedPreference(key,fallback){try{const value=localStorage.getItem(key);return value===null?fallback:value}catch{return fallback}}
@@ -804,6 +1066,10 @@ function initLayout(){
   setSidebarWidth(storedPreference('crafts.sidebarWidth',280),false);setSpectrumShare(storedPreference('crafts.spectrumShare',24),false);
   const saved=storedPreference('crafts.sidebarCollapsed',null);app.sidebarUserChoice=saved!==null;setSidebarCollapsed(saved===null?innerWidth<980:saved==='1',false);
   $('#toggleSidebar').onclick=()=>setSidebarCollapsed(!document.body.classList.contains('sidebar-collapsed'));
+  const pw=$('#profileWidth');
+  pw.value=String(storedPreference('crafts.profileWidth',102));
+  function showWidth(){ $('#profileWidthValue').textContent=pw.value+' px' }
+  showWidth();pw.oninput=()=>{showWidth();storePreference('crafts.profileWidth',pw.value);if(app.state?.ready)navigationChanged()};
   $('#spectrumShare').oninput=e=>setSpectrumShare(e.target.value);
   const divider=$('#sidebarResize');let resizing=null;
   divider.addEventListener('pointerdown',e=>{if(e.button!==0)return;e.preventDefault();divider.setPointerCapture(e.pointerId);resizing={x:e.clientX,width:Number(divider.getAttribute('aria-valuenow'))};document.body.classList.add('resizing-sidebar')});
@@ -813,17 +1079,32 @@ function initLayout(){
   addEventListener('resize',()=>{setSidebarWidth(Number(divider.getAttribute('aria-valuenow')),false);if(!app.sidebarUserChoice)setSidebarCollapsed(innerWidth<980,false)});
   document.addEventListener('pointerdown',e=>{if(!$('#displayOptions').contains(e.target))$('#displayOptions').open=false});
 }
+const shortcutControls={
+  '[':'#prevBeam',']':'#nextBeam',o:'#applyAuto',v:'#showAuto',a:'#both',
+  d:'[data-mode="frequency"]',t:'[data-mode="time"]',c:'[data-mode="box"]',
+  w:'[data-mode="delete"]',g:'[data-mode="pan"]',q:'#undo',s:'#save',
+  '0':'#reset',',':'#displayOptions > summary'
+};
+for(const [key,selector] of Object.entries(shortcutControls)){
+  const el=$(selector),label=el.labels?.[0]||el,badge=document.createElement('kbd');
+  badge.textContent=key.toUpperCase();badge.setAttribute('aria-hidden','true');
+  el.setAttribute('aria-keyshortcuts',key.toUpperCase());label.append(badge);
+}
 addEventListener('keydown',e=>{
   if(!$('#saveConfirm').hidden){
     if(e.key==='Escape'){e.preventDefault();closeSaveConfirmation()}
     if(e.key==='Tab'){const buttons=[$('#cancelSave'),$('#confirmSave')].filter(b=>!b.disabled);if(buttons.length){e.preventDefault();const i=buttons.indexOf(document.activeElement);buttons[(i+(e.shiftKey?-1:1)+buttons.length)%buttons.length].focus()}}
     return;
   }
-  if(e.target.matches('input,select,textarea')||e.ctrlKey||e.metaKey)return;
-  if(e.key==='Escape'){app.drag=null;app.colorDrag=null;$('#displayOptions').open=false;requestLocalDraw();return}
-  if(app.state?.busy||app.scopePending)return;
-  const k=e.key.toLowerCase();if('ftbdg'.includes(k))setMode({f:'frequency',t:'time',b:'box',d:'delete',g:'pan'}[k]);
-  if(k==='u')$('#undo').click();if(k==='s'){$('#save').click();e.preventDefault()}if(k==='0')$('#reset').click();
+  if(e.defaultPrevented||e.isComposing||e.ctrlKey||e.metaKey||e.altKey||e.target.isContentEditable||e.target.closest('dialog[open],input:not([type=checkbox]),select,textarea'))return;
+  if(e.key==='Escape'){app.drag=null;app.profileDrag=null;app.colorDrag=null;$('#displayOptions').open=false;requestLocalDraw();return}
+  if(!app.state?.ready||app.state.busy||app.scopePending||e.shiftKey||app.drag||app.profileDrag||app.colorDrag||document.querySelector('dialog[open]'))return;
+  if(moveHoveredGuide(e.key)){e.preventDefault();return}
+  if(e.repeat)return;
+  const selector=shortcutControls[e.key.toLowerCase()];
+  if(typeof selector!=='string')return;
+  const target=$(selector);if(target.disabled)return;
+  e.preventDefault();target.click();
 });
 initLayout();
 new ResizeObserver(()=>{if(app.state?.ready)navigationChanged()}).observe($('.plot-stack'));
