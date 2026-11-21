@@ -23,6 +23,11 @@ Dec+2654_22_09_arcdrift-M01_W_0007_T.fits
 Dec+2654_22_09_arcdrift-M19_W_0007_T.fits
 ```
 
+In the native web UI, a beam may end early if its timestamps exactly match the
+start of the common time axis. Its missing tail is blank in single-beam view,
+and the mean uses the remaining valid samples. Each exported beam mask keeps
+its original record count. All 19 beam files are still required.
+
 ## Run
 
 For server-side data with a local macOS window, start XQuartz on the Mac and
