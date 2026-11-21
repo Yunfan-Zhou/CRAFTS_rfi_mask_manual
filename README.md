@@ -176,6 +176,13 @@ python -m pytest -q test_crafts_tod_mask.py
 
 ## Update Log
 
+### 2026-11-21 — Native web UI 1.9.0
+
+- In 19-beam Mean, enable `Mean 应用手动 mask` to exclude each beam’s manual
+  flags before averaging. The waterfalls and both profiles use the resulting
+  mean. This preview defaults to off and includes unsaved edits.
+- The display settings list the four percentile ranges for waterfall contrast.
+
 ### 2026-11-21 — Native web UI 1.8.1
 
 - Press `M` to toggle manual mask overlays and `V` to toggle automatic overlays.
