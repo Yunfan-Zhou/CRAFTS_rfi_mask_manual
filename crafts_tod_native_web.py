@@ -35,6 +35,7 @@ from crafts_tod_mask import (
     PolarizationMask,
     SingleBeamTod,
     beam_mask_path,
+    build_mask,
     discover_groups,
     load_beam_averaged_tod_with_auto_masks,
     load_single_beam_tod_with_auto_masks,
@@ -49,7 +50,7 @@ from crafts_tod_mask import (
 )
 
 
-APP_VERSION = "manual-rfi-web-1.2.1"
+APP_VERSION = "manual-rfi-web-1.3.0"
 DEFAULT_INPUT_DIR = Path(
     "/data71/common_storage/zhouyunfan/test_codex20260722/oldpipeline/test_all/"
     "gzn_20260831/five_stripes_current_modules_0001_0010_v2/server_data/"
@@ -225,6 +226,10 @@ class NativeMaskState:
         self.disk_signature = None
         self.saved_annotations_loaded = False
         self.last_saved = ""
+        self.apply_manual_mean = False
+        self.manual_mean_epoch = 0
+        self.manual_display = None
+        self.manual_beam_cache = None
         self.profiles = {}
         self.args = args
         self.groups = discover_groups(args.input_dir)
@@ -297,6 +302,7 @@ class NativeMaskState:
     def public_state(self) -> dict[str, Any]:
         with self.lock:
             ready = self.aggregate is not None and self.phase not in {"loading", "beam-loading", "error"}
+            pending = self.apply_manual_mean and self.manual_display is None
             group = self.group
             return {
                 "version": APP_VERSION, "save_dir": str(self.args.mask_dir),
@@ -306,7 +312,10 @@ class NativeMaskState:
                 "phase": self.phase,
                 "busy": self.busy,
                 "message": self.message,
-                "ready": ready,
+                "ready": ready and not pending,
+                "apply_manual_mean": self.apply_manual_mean,
+                "manual_mean_pending": pending,
+                "manual_mean_epoch": self.manual_mean_epoch,
                 "dirty": self.dirty,
                 "saved_annotations_loaded": self.saved_annotations_loaded,
                 "revision": self.revision,
@@ -335,6 +344,9 @@ class NativeMaskState:
                 raise ValueError("Unsaved edits: save or revert before changing nfile")
             if index is not None:
                 self.index = index % len(self.groups)
+            self.apply_manual_mean = False
+            self.manual_display = None
+            self.manual_beam_cache = None
             self.saved_annotations_loaded = False
             self.load_token += 1
             token = self.load_token
@@ -414,6 +426,8 @@ class NativeMaskState:
             item = next((candidate for candidate in self.group.files if candidate.beam == beam), None)
             if item is None:
                 raise ValueError(f"Beam {beam!r} is not available")
+            if self.apply_manual_mean:
+                self.set_manual_mean(self.group.key, False)
             self._view_request_token += 1
             request_token = self._view_request_token
             load_token = self.load_token
@@ -681,6 +695,51 @@ class NativeMaskState:
             self._log(f"SAVE ERROR: {error}; 请检查输出目录后重试", "ready", False)
             raise
 
+    def _masked_beam_means(self, group, load_token, document, medians, cached):
+        # Common exclusions apply to every beam equally and are handled on
+        # the finished grid. Only per-beam edits require new sample counts.
+        layers = {
+            beam: pols for beam, pols in document.beam_polarizations.items()
+            if any(pol.has_regions for pol in pols)
+        }
+        if not layers:
+            return None
+        if cached is not None and layers == cached[0]:
+            return cached
+
+        def report_progress(message):
+            if load_token != self.load_token or not self.apply_manual_mean:
+                raise RuntimeError("Mean 预览已取消")
+            self._log(message)
+
+        filtered = load_beam_averaged_tod_with_auto_masks(
+            group, AutoMaskDirectories(self.args.one_channel_dir, self.args.sat1380_dir),
+            block_records=self.args.block_records, require_all_masks=self.args.require_all_auto_masks,
+            allow_short_tail=True, beam_manual_layers=layers, progress=report_progress,
+        )
+        for pol, median in enumerate(medians):
+            filtered.raw_mean[:, :, pol] -= median
+            filtered.auto_masked_mean[:, :, pol] -= median
+        return layers, filtered.raw_mean, filtered.auto_masked_mean
+
+    def set_manual_mean(self, group_key: str, enabled: bool) -> None:
+        with self.lock:
+            if self.group.key != group_key or self.view_mode != "mean" or self.aggregate is None:
+                raise ValueError("此开关用于当前 nfile 的 19-beam Mean 视图")
+            if type(enabled) is not bool:
+                raise ValueError("Expected a boolean mask setting")
+            if enabled == self.apply_manual_mean:
+                return
+            self.apply_manual_mean = enabled
+            self.manual_display = None
+            self.manual_mean_epoch += 1
+            self.image_cache.clear()
+            self.spectra = {}
+            self.profiles = {}
+            self.spectrum_revision += 1
+            self._log("正在应用手动 mask 到 19-beam Mean" if enabled else "已关闭 Mean 手动 mask")
+        self.schedule_spectrum()
+
     def schedule_spectrum(self) -> None:
         with self.lock:
             if self.aggregate is None:
@@ -688,6 +747,8 @@ class NativeMaskState:
             # One driver owns at most one queued/running calculation. Edits
             # arriving meanwhile replace its next request rather than adding
             # another full-array calculation to the data executor.
+            if self.apply_manual_mean:
+                self.manual_display = None
             self._spectrum_request_token += 1
             if self._spectrum_task is not None and not self._spectrum_task.done():
                 return
@@ -708,6 +769,10 @@ class NativeMaskState:
                         document = copy.deepcopy(self.document)
                         frequency = self.frequency
                         single = self.single
+                        group = self.group
+                        apply_manual = self.apply_manual_mean
+                        cached = self.manual_beam_cache
+                        medians = tuple(self.local_medians)
 
                     def calculate_all():
                         # Loading/saving can occupy the executor during the
@@ -719,9 +784,20 @@ class NativeMaskState:
                                 or load_token != self.load_token
                             ):
                                 return None
+                        raw, clean = aggregate.raw_mean, aggregate.auto_masked_mean
+                        beam_cache = cached
+                        common = [None, None]
+                        if apply_manual:
+                            beam_cache = self._masked_beam_means(group, load_token, document, medians, cached)
+                            if beam_cache is not None:
+                                _, raw, clean = beam_cache
+                            for pol, layer in enumerate(document.polarizations):
+                                if layer.has_regions:
+                                    common[pol] = build_mask(frequency, len(raw), document, pol)
+                        display = (raw, clean, common) if apply_manual else None
                         mean_result = {
-                            False: masked_time_average(aggregate.raw_mean, frequency, document, include_profile=True),
-                            True: masked_time_average(aggregate.auto_masked_mean, frequency, document, include_profile=True),
+                            False: masked_time_average(raw, frequency, document, include_profile=True),
+                            True: masked_time_average(clean, frequency, document, include_profile=True),
                         }
                         single_result = None
                         if single is not None:
@@ -734,11 +810,18 @@ class NativeMaskState:
                                     additional_mask=single.union_mask, beam=single.beam, include_profile=True,
                                 ),
                             }
-                        return mean_result, single_result
+                        return mean_result, single_result, display, beam_cache
 
-                    result = await asyncio.get_running_loop().run_in_executor(
-                        self.executor, calculate_all
-                    )
+                    try:
+                        result = await asyncio.get_running_loop().run_in_executor(self.executor, calculate_all)
+                    except Exception as error:
+                        if token != self._spectrum_request_token or load_token != self.load_token:
+                            continue
+                        if not apply_manual:
+                            raise
+                        self.set_manual_mean(group.key, False)
+                        self._log(f"手动 mask 均值计算失败，已恢复默认均值：{error}")
+                        continue
                     with self.lock:
                         if self.aggregate is None:
                             return
@@ -749,7 +832,11 @@ class NativeMaskState:
                             or load_token != self.load_token
                         ):
                             continue
-                        mean_result, single_result = result
+                        mean_result, single_result, display, self.manual_beam_cache = result
+                        self.manual_display = display
+                        if display is not None:
+                            self.manual_mean_epoch += 1
+                            self.image_cache.clear()
                         self.spectra = {k:v[0] for k,v in mean_result.items()}
                         self.profiles = {("mean", k):v[1] for k,v in mean_result.items()}
                         if single is self.single and single_result is not None:
@@ -868,9 +955,15 @@ class NativeMaskState:
                 beam = ""
                 values = self.aggregate.auto_masked_mean[:, :, pol] if apply_auto else self.aggregate.raw_mean[:, :, pol]
                 value_mask = None
+                if self.apply_manual_mean:
+                    if self.manual_display is None:
+                        raise ValueError("正在计算手动 mask 均值")
+                    raw, clean, common = self.manual_display
+                    values = (clean if apply_auto else raw)[:, :, pol]
+                    value_mask = common[pol]
                 auto = self.aggregate.union_flagged_beam_count[:, :, pol] if show_auto else None
                 auto_total_beams = 19
-            key = (self.revision, view_mode, beam, pol, x0, x1, y0, y1, width, height, apply_auto, show_auto, contrast, auto_width, vmin, vmax)
+            key = (self.revision, self.manual_mean_epoch, view_mode, beam, pol, x0, x1, y0, y1, width, height, apply_auto, show_auto, contrast, auto_width, vmin, vmax)
             cached = self.image_cache.get(key)
             if cached is not None:
                 return cached
@@ -975,6 +1068,8 @@ class ActionHandler(BaseHandler):
                 result["paths"] = await self.state.save()
             elif action == "save_summary":
                 result["summary"] = self.state.save_summary()
+            elif action == "manual_mean":
+                self.state.set_manual_mean(payload["group"], payload["enabled"])
             elif action == "set_view":
                 await self.state.set_view(
                     str(payload.get("view_mode", "mean")),

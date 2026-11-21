@@ -59,6 +59,10 @@ class PolarizationMask:
     time_ranges_records: list[list[int]] = field(default_factory=list)
     boxes: list[dict[str, list[float] | list[int]]] = field(default_factory=list)
 
+    @property
+    def has_regions(self) -> bool:
+        return bool(self.frequency_ranges_mhz or self.time_ranges_records or self.boxes)
+
 
 @dataclass
 class MaskDocument:
@@ -581,6 +585,7 @@ def load_beam_averaged_tod_with_auto_masks(
     *,
     require_all_masks: bool = False,
     allow_short_tail: bool = False,
+    beam_manual_layers: dict[str, list[PolarizationMask]] | None = None,
 ) -> BeamAveragedTod:
     """Average 19 beams before/after each beam's science-RFI mask union."""
     frequency, mjd, output_shape = validate_group(group, allow_short_tail=allow_short_tail)
@@ -604,6 +609,11 @@ def load_beam_averaged_tod_with_auto_masks(
         native_shape = (records, len(frequency), 2)
         if records < len(mjd):
             warnings.append(f"{item.beam}: {records}/{len(mjd)} records; missing trailing records shown as NaN")
+        manual = [
+            _expand_polarization_mask(frequency, records, layer)
+            if layer.has_regions else None
+            for layer in (beam_manual_layers or {}).get(item.beam, [])
+        ]
         layers, files, layer_warnings = load_auto_mask_layers(
             item.path,
             directories,
@@ -630,6 +640,9 @@ def load_beam_averaged_tod_with_auto_masks(
                 stop = min(start + max(1, int(block_records)), records)
                 block = np.asarray(canonical[start:stop, :, :2], dtype=np.float32)
                 finite = np.isfinite(block)
+                for pol, excluded in enumerate(manual):
+                    if excluded is not None:
+                        finite[:, :, pol] &= ~excluded[start:stop]
                 clean = finite & ~union[start:stop]
                 raw_total[start:stop] += np.where(finite, block, 0.0)
                 clean_total[start:stop] += np.where(clean, block, 0.0)

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="application-version" content="manual-rfi-ui-1.8.1">
+<meta name="application-version" content="manual-rfi-ui-1.9.0">
 <title>CRAFTS Manual RFI Mask</title>
 <style>
 :root {
@@ -314,6 +314,7 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
         <div class="control-group auto-controls" aria-label="显示与标记">
           <span class="group-label">显示与标记</span>
           <label class="check"><input id="applyAuto" type="checkbox" checked>使用自动 mask</label>
+          <label class="check" title="按当前公共层及各 beam 的手动标记剔除样本，再计算 19-beam Mean"><input id="applyManualMean" type="checkbox">Mean 应用手动 mask</label>
           <label class="check"><input id="showAuto" type="checkbox" checked>显示自动标记</label>
           <label class="check" title="显示或隐藏两幅瀑布图上的手动 mask 区域"><input id="showManual" type="checkbox" checked>显示手动标记</label>
           <label class="check"><input id="both" type="checkbox">双偏振</label>
@@ -354,7 +355,7 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
               <span class="display-label">瀑布图色阶</span>
               <button id="contrast">对比度 1/4</button>
               <button id="colorAuto" title="清除 Pol0/Pol1 手动色标范围">色标自动</button>
-              <p class="display-note">也可拖动右侧色标箭头，分别调整两个偏振的亮度范围。</p>
+              <p class="display-note">1/4 至 4/4 分别使用 P0.5–P99.5、P1–P99、P2–P98、P5–P95。拖动右侧色标箭头可单独设置上下限。</p>
             </div>
             <div class="display-row">
               <span class="display-label">图像分辨率</span>
@@ -890,7 +891,13 @@ function syncNfileSelect(state){
 function applyState(s,initial=false){
   if(app.scopePending)return;
   const prior=app.state,newGroup=!prior||prior.group.key!==s.group.key;
-  const newScope=newGroup||prior.view_mode!==s.view_mode||prior.selected_beam!==s.selected_beam;
+  const meanChanged=prior&&(prior.manual_mean_epoch!==s.manual_mean_epoch||
+    prior.manual_mean_pending!==s.manual_mean_pending);
+  const newScope=newGroup||meanChanged||prior.view_mode!==s.view_mode||prior.selected_beam!==s.selected_beam;
+  if(meanChanged){
+    app.spectrumRequest++;app.meanSpectrum=null;app.spectrumData=null;app.spectrumDrawCache=null;
+    const canvas=$('#spectrum');canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+  }
   if(newScope||!s.ready||s.busy){
     if(app.drag?.kind==='spectrum-range')app.drag=null;
     app.profileDrag=null;
@@ -911,6 +918,9 @@ function applyState(s,initial=false){
   document.querySelectorAll('.toolbar button,.toolbar select,.toolbar input').forEach(b=>b.disabled=s.busy&&b.id!=='spectrumShare');
   const beams=s.group.beams,idx=beams.indexOf(s.selected_beam),single=s.view_mode==='single';
   $('#prevBeam').disabled=s.busy||single&&idx<=0;$('#nextBeam').disabled=s.busy||single&&idx>=beams.length-1;
+  $('#applyManualMean').checked=Boolean(s.apply_manual_mean);
+  $('#applyManualMean').disabled=single||s.busy||(!s.ready&&!s.manual_mean_pending)||!('apply_manual_mean' in s);
+  document.querySelectorAll('.loading-cover span').forEach(el=>el.textContent=s.manual_mean_pending?'正在按手动 mask 重算均值…':'载入数据…');
   const loaded=s.saved_annotations_loaded===true;
   $('#savedInfo').classList.toggle('saved-loaded',loaded);
   $('#loadedHint').hidden=!loaded;
@@ -1045,6 +1055,13 @@ $('#rfiThin').onclick=()=>changeAutoWidth(-1);$('#rfiThick').onclick=()=>changeA
 $('#spectrumY').onchange=()=>{app.spectrumYMode=$('#spectrumY').value;requestLocalDraw()};
 $('#reset').onclick=()=>{if(!app.state?.ready)return;rememberView();app.view={f0:app.state.frequency_range[0],f1:app.state.frequency_range[1],t0:0,t1:app.state.shape[0]};navigationChanged(true)};
 $('#viewBack').onclick=()=>{if(!app.history.length)return;app.view=app.history.pop();$('#viewBack').disabled=!app.history.length;navigationChanged(true)};
+$('#applyManualMean').onchange=async e=>{
+  const control=e.target;
+  control.disabled=true;
+  try{await action({action:'manual_mean',group:app.state.group.key,enabled:control.checked})}
+  catch{control.checked=Boolean(app.state.apply_manual_mean)}
+  finally{control.disabled=app.state.view_mode!=='mean'||app.state.busy}
+};
 $('#applyAuto').onchange=()=>{app.spectrumKey=null;app.meanSpectrum=null;app.spectrumData=null;renderAll();pollSpectrum(true)};
 $('#showAuto').onchange=()=>renderAll();
 $('#showManual').onchange=requestLocalDraw;

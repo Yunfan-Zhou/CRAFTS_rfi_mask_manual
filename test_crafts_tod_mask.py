@@ -106,6 +106,19 @@ def test_19_beam_average_applies_only_science_rfi_masks(tmp_path: Path) -> None:
     assert result.layer_flagged_beam_count["sat1380"][0, 0, 0] == 1
     assert result.layer_available_beams == {"one_channel": 19, "sat1380": 19}
 
+    manual = PolarizationMask(frequency_ranges_mhz=[[1000.0, 1000.0]])
+    filtered = load_beam_averaged_tod_with_auto_masks(
+        group,
+        AutoMaskDirectories(one_channel=one_dir, sat1380=sat_dir),
+        require_all_masks=True,
+        beam_manual_layers={"M19": [manual, PolarizationMask()]},
+    )
+    # Pol 0 averages M01–M18, or M03–M18 when automatic flags are applied.
+    assert np.isclose(filtered.raw_mean[0, 0, 0], 9.5)
+    assert np.isclose(filtered.auto_masked_mean[0, 0, 0], 10.5)
+    np.testing.assert_array_equal(filtered.raw_mean[:, :, 1], result.raw_mean[:, :, 1])
+    np.testing.assert_array_equal(filtered.raw_mean[:, 1:, 0], result.raw_mean[:, 1:, 0])
+
     single = load_single_beam_tod_with_auto_masks(
         group.files[0],
         AutoMaskDirectories(one_channel=one_dir, sat1380=sat_dir),
