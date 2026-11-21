@@ -377,7 +377,18 @@ def _tod_axes(shape: tuple[int, ...], ntime: int, nfreq: int) -> tuple[int, int,
     )
 
 
-def validate_group(group: TodGroup) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int]]:
+def require_time_prefix(native: np.ndarray, reference: np.ndarray) -> None:
+    """Accept missing trailing records only, with exact observed timestamps."""
+    if (
+        not len(native) or len(native) > len(reference)
+        or not np.all(np.isfinite(reference))
+        or not np.all(np.diff(reference) > 0)
+        or not np.array_equal(native, reference[:len(native)])
+    ):
+        raise ValueError("Time axis is not an exact prefix of the reference grid")
+
+
+def validate_group(group: TodGroup, *, allow_short_tail: bool = False) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int]]:
     if not group.files:
         raise ValueError(f"No beam files in group {group.key}")
     beams = tuple(sorted(item.beam for item in group.files))
@@ -388,16 +399,21 @@ def validate_group(group: TodGroup) -> tuple[np.ndarray, np.ndarray, tuple[int, 
             f"Group {group.key} must contain exactly M01-M19; "
             f"missing={missing}, extra={extra}"
         )
-    reference_freq, reference_time, reference_shape, _ = _read_axes(group.files[0].path)
+    reference_item = group.files[0]
+    if allow_short_tail:
+        reference_item = max(group.files, key=lambda item: len(_read_axes(item.path)[1]))
+    reference_freq, reference_time, reference_shape, _ = _read_axes(reference_item.path)
     _tod_axes(reference_shape, len(reference_time), len(reference_freq))
-    for item in group.files[1:]:
+    for item in group.files:
         frequency, time, shape, _ = _read_axes(item.path)
         _tod_axes(shape, len(time), len(frequency))
         if frequency.shape != reference_freq.shape or not np.allclose(
             frequency, reference_freq, rtol=0.0, atol=1.0e-7, equal_nan=True
         ):
             raise ValueError(f"Frequency axis mismatch: {item.path}")
-        if time.shape != reference_time.shape or not np.allclose(
+        if allow_short_tail and len(time) < len(reference_time):
+            require_time_prefix(time, reference_time)
+        elif time.shape != reference_time.shape or not np.allclose(
             time, reference_time, rtol=0.0, atol=1.0e-10, equal_nan=True
         ):
             raise ValueError(f"Time axis mismatch: {item.path}")
@@ -552,9 +568,10 @@ def load_beam_averaged_tod_with_auto_masks(
     progress: Callable[[str], None] | None = None,
     *,
     require_all_masks: bool = False,
+    allow_short_tail: bool = False,
 ) -> BeamAveragedTod:
     """Average 19 beams before/after each beam's science-RFI mask union."""
-    frequency, mjd, output_shape = validate_group(group)
+    frequency, mjd, output_shape = validate_group(group, allow_short_tail=allow_short_tail)
     raw_total = np.zeros(output_shape, dtype=np.float32)
     clean_total = np.zeros(output_shape, dtype=np.float32)
     raw_count = np.zeros(output_shape, dtype=np.uint8)
@@ -570,30 +587,35 @@ def load_beam_averaged_tod_with_auto_masks(
     for beam_number, item in enumerate(group.files, start=1):
         if progress is not None:
             progress(f"Loading {item.beam} ({beam_number}/19): {item.path.name}")
+        _, native_mjd, _, _ = _read_axes(item.path)
+        records = len(native_mjd)
+        native_shape = (records, len(frequency), 2)
+        if records < len(mjd):
+            warnings.append(f"{item.beam}: {records}/{len(mjd)} records; missing trailing records shown as NaN")
         layers, files, layer_warnings = load_auto_mask_layers(
             item.path,
             directories,
             frequency,
-            mjd,
-            output_shape,
+            native_mjd,
+            native_shape,
             require_all=require_all_masks,
         )
         source_files[item.beam] = files
         warnings.extend(layer_warnings)
-        union = np.zeros(output_shape, dtype=bool)
+        union = np.zeros(native_shape, dtype=bool)
         for name, mask in layers.items():
-            layer_counts[name] += mask
+            layer_counts[name][:records] += mask
             union |= mask
             available[name] += 1
-        union_count += union
+        union_count[:records] += union
 
         with fits.open(item.path, memmap=True) as hdul:
             _, _, tod_index = _select_hdus(hdul)
             raw = hdul[tod_index].data
-            source_axes = _tod_axes(raw.shape, len(mjd), len(frequency))
+            source_axes = _tod_axes(raw.shape, records, len(frequency))
             canonical = np.moveaxis(raw, source_axes, (0, 1, 2))
-            for start in range(0, len(mjd), max(1, int(block_records))):
-                stop = min(start + max(1, int(block_records)), len(mjd))
+            for start in range(0, records, max(1, int(block_records))):
+                stop = min(start + max(1, int(block_records)), records)
                 block = np.asarray(canonical[start:stop, :, :2], dtype=np.float32)
                 finite = np.isfinite(block)
                 clean = finite & ~union[start:stop]
@@ -632,6 +654,7 @@ def load_single_beam_tod_with_auto_masks(
     block_records: int = 128,
     *,
     require_all_masks: bool = False,
+    reference_mjd: np.ndarray | None = None,
 ) -> SingleBeamTod:
     """Load one beam and its own science-RFI mask union on the native TOD grid."""
     frequency, mjd, source_shape, _ = _read_axes(item.path)
@@ -664,6 +687,16 @@ def load_single_beam_tod_with_auto_masks(
         frequency = frequency[::-1].copy()
         raw_values = raw_values[:, ::-1, :].copy()
         union = union[:, ::-1, :].copy()
+    if reference_mjd is not None and len(mjd) != len(reference_mjd):
+        require_time_prefix(mjd, reference_mjd)
+        records = len(mjd)
+        padded = np.full((len(reference_mjd), len(frequency), 2), np.nan, dtype=np.float32)
+        padded[:records] = raw_values
+        padded_union = np.zeros(padded.shape, dtype=bool)
+        padded_union[:records] = union
+        raw_values, union = padded, padded_union
+        mjd = reference_mjd.copy()
+        warnings.append(f"{item.beam}: {records}/{len(mjd)} records; missing trailing records shown as NaN")
     return SingleBeamTod(
         beam=item.beam,
         frequency_mhz=frequency,
@@ -813,6 +846,7 @@ def save_beam_mask_products(
     mjd: np.ndarray,
     document: MaskDocument,
     json_path: str | Path,
+    native_record_counts: dict[str, int] | None = None,
 ) -> list[Path]:
     """Write one manual-only, exact-grid mask product for each input beam."""
     global_manual = np.stack(
@@ -826,14 +860,18 @@ def save_beam_mask_products(
     json_sha256 = hashlib.sha256(json_path.read_bytes()).hexdigest()
     output_paths = []
     for item in group.files:
-        manual = global_manual.copy()
+        records = len(mjd) if native_record_counts is None else native_record_counts[item.beam]
+        if not 0 < records <= len(mjd):
+            raise ValueError(f"Invalid native record count for {item.beam}")
+        native_global = global_manual[:records]
+        manual = native_global.copy()
         beam_layers = document.beam_polarizations.get(item.beam)
         beam_specific_count = 0
         if beam_layers is not None:
             for polarization in (0, 1):
                 specific = _expand_polarization_mask(
                     frequency_mhz,
-                    len(mjd),
+                    records,
                     beam_layers[polarization],
                 )
                 beam_specific_count += int(np.count_nonzero(specific))
@@ -849,7 +887,7 @@ def save_beam_mask_products(
                 stream,
                 mask=manual,
                 freq=np.asarray(frequency_mhz, dtype=np.float64),
-                mjd=np.asarray(mjd, dtype=np.float64),
+                mjd=np.asarray(mjd[:records], dtype=np.float64),
                 axis_order=np.asarray("time, frequency, polarization"),
                 processing_mode=np.asarray("mask_only"),
                 science_data_modified=np.asarray(False),
@@ -863,7 +901,7 @@ def save_beam_mask_products(
                 reviewed_clean=np.asarray(flagged_count == 0),
                 manual_sample_count=np.asarray(flagged_count, dtype=np.int64),
                 manual_global_sample_count=np.asarray(
-                    np.count_nonzero(global_manual), dtype=np.int64
+                    np.count_nonzero(native_global), dtype=np.int64
                 ),
                 manual_beam_specific_sample_count=np.asarray(
                     beam_specific_count, dtype=np.int64

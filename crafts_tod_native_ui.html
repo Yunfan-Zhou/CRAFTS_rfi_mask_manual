@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="application-version" content="manual-rfi-ui-1.5">
+<meta name="application-version" content="manual-rfi-ui-1.5.3">
 <title>CRAFTS Manual RFI Mask</title>
 <style>
 :root {
@@ -398,6 +398,7 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
       <div class="interaction-strip">
         <span id="modeHint">当前模式：频率标记</span>
         <span id="viewStatus" aria-live="polite"></span>
+        <span id="nfileStatus" aria-live="polite" style="color:var(--warn)"></span>
         <span class="gesture-hint">缩放：Option / Alt + 拖动频率 · Shift + 拖动 Record · 相同按键 + 滚轮</span>
       </div>
     </div>
@@ -847,13 +848,19 @@ function applyState(s,initial=false){
   $('#invalidLegend').textContent=s.view_mode==='single'?'当前 beam 无有效值（NaN）':'19 beams 均无有效值（NaN，不是负值）';
   $('#plotTitle0').textContent=`Pol 0 · ${label} · T−median`;$('#plotTitle1').textContent=`Pol 1 · ${label} · T−median`;
   $('#summary').textContent=`视图 ${label}\n尺寸 ${s.shape[0]||'—'} × ${s.shape[1]||'—'}\nOneChannel ${s.auto_available.one_channel??0}/19\nSAT1380 ${s.auto_available.sat1380??0}/19\n${s.message}`;
+  if(s.warnings?.length)$('#summary').textContent+='\n'+s.warnings.join('\n');
   const log=$('#log'),nextLog=s.logs.map(x=>`${x.time}  ${x.message}`).join('\n');
   if(log.textContent!==nextLog){const follow=log.scrollHeight-log.scrollTop-log.clientHeight<45;log.textContent=nextLog;if(follow)log.scrollTop=log.scrollHeight}
   document.querySelectorAll('.loading-cover').forEach(cover=>cover.hidden=s.ready);
   document.querySelectorAll('.toolbar button,.toolbar select,.toolbar input').forEach(b=>b.disabled=s.busy&&b.id!=='spectrumShare');
   const beams=s.group.beams,idx=beams.indexOf(s.selected_beam),single=s.view_mode==='single';
   $('#prevBeam').disabled=s.busy||single&&idx<=0;$('#nextBeam').disabled=s.busy||single&&idx>=beams.length-1;
-  $('#prev').disabled=s.busy||s.dirty||s.index===0;$('#next').disabled=s.busy||s.dirty||s.index===s.group_count-1;
+  $('#prev').disabled=s.busy||s.index===0;$('#next').disabled=s.busy||s.index===s.group_count-1;
+  const navigationReason=s.busy?'正在加载或保存，请稍候':s.dirty?'切换 nfile 时将询问是否丢弃未保存修改':'';
+  $('#nfileStatus').textContent=navigationReason;
+  $('#prev').title=navigationReason||(s.index===0?'已经是第一个 nfile':'打开上一个 nfile');
+  $('#next').title=navigationReason||(s.index===s.group_count-1?'已经是最后一个 nfile':'打开下一个 nfile');
+
   $('#clearBeam').disabled=s.busy||!single;$('#applyDir').disabled=$('#defaultDir').disabled=s.busy;
   $('#saveLocation').textContent=s.save_file;$('#dirHint').textContent='可选根目录：'+s.save_root;
   $('#lastSaved').textContent=s.last_saved?'保存成功：'+s.last_saved:'';
@@ -869,9 +876,10 @@ async function poll(){
   try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw Error(response.statusText);const s=await response.json();applyState(s,!app.state)}catch(error){syncReviewTimers(null);$('#badge').textContent='disconnected'}
   setTimeout(poll,700);
 }
-async function action(payload,{apply=true}={}){
+async function action(payload,{apply=true,navigation=false}={}){
   try{
-    if(['previous','next','load'].includes(payload.action)&&app.state?.dirty)throw Error('有未保存的标记，请先保存或恢复已保存内容。');
+    if(nfileNavigationPending&&!navigation)throw Error('正在切换 nfile，请稍候。');
+    if(['previous','next','load'].includes(payload.action)&&app.state?.dirty&&!navigation)throw Error('请使用上一个或下一个 nfile 按钮确认切换。');
     const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),d=await r.json();
     if(!r.ok)throw Error(d.error||r.statusText);if(apply)applyState(d.state);return d;
   }catch(error){toast(error.message,true);throw error}
@@ -892,7 +900,41 @@ async function changeDataView(){
   catch(error){if(seq===app.scopeRequest){app.scopePending=false;const response=await fetch('/api/state');applyState(await response.json())}}
 }
 $('#viewMode').onchange=changeDataView;$('#beamSelect').onchange=changeDataView;
-for(const[id,act]of[['undo','undo'],['prev','previous'],['next','next']])$('#'+id).onclick=()=>action({action:act}).catch(()=>{});
+$('#undo').onclick=()=>action({action:'undo'}).catch(()=>{});
+let nfileNavigationPending=false;
+async function navigateNfile(step){
+  if(nfileNavigationPending||app.scopePending||!app.state?.ready||app.state.busy)return;
+  nfileNavigationPending=true;
+  app.scopePending=true;
+  $('#prev').disabled=$('#next').disabled=true;
+  try{
+    const response=await fetch('/api/state',{cache:'no-store'});
+    if(!response.ok)throw Error('读取当前标注状态失败，请重试。');
+    const state=await response.json(),targetIndex=state.index+step;
+    if(state.busy||targetIndex<0||targetIndex>=state.group_count)return;
+    const target=state.groups[targetIndex];
+    if(state.dirty&&!confirm(`当前 nfile ${state.group.serial} 有未保存的修改（包含所有 beam）。\n确认丢弃这些修改并打开 nfile ${target.serial}？\n选择“取消”可继续当前标注。`))return;
+    const latestResponse=await fetch('/api/state',{cache:'no-store'});
+    if(!latestResponse.ok)throw Error('确认当前标注状态失败，请重试。');
+    const latest=await latestResponse.json();
+    if(latest.group.key!==state.group.key||latest.revision!==state.revision||latest.busy){
+      throw Error('标注状态已更新，请重新点击切换。');
+    }
+    // Reuse the saved-document restore operation to discard the confirmed draft.
+    if(state.dirty)await action({action:'revert'},{apply:false,navigation:true});
+    await action({action:'load',index:targetIndex},{apply:false,navigation:true});
+  }catch(error){toast(error.message,true)}
+  finally{
+    app.scopePending=false;
+    nfileNavigationPending=false;
+    try{
+      const response=await fetch('/api/state',{cache:'no-store'});
+      if(response.ok)applyState(await response.json());
+    }catch{toast('连接中断，请刷新查看切换结果。',true)}
+  }
+}
+$('#prev').onclick=()=>navigateNfile(-1);
+$('#next').onclick=()=>navigateNfile(1);
 function stepBeam(step){if(!app.state?.ready||app.scopePending)return;const s=app.state,beams=s.group.beams;const i=s.view_mode==='mean'?(step>0?0:beams.length-1):beams.indexOf(s.selected_beam)+step;if(i<0||i>=beams.length)return;$('#beamSelect').value=beams[i];$('#viewMode').value='single';changeDataView()}
 $('#prevBeam').onclick=()=>stepBeam(-1);$('#nextBeam').onclick=()=>stepBeam(1);
 $('#applyDir').onclick=()=>action({action:'directory',path:$('#dirInput').value}).catch(()=>{});
@@ -1082,7 +1124,7 @@ function initLayout(){
 const shortcutControls={
   '[':'#prevBeam',']':'#nextBeam',o:'#applyAuto',v:'#showAuto',a:'#both',
   d:'[data-mode="frequency"]',t:'[data-mode="time"]',c:'[data-mode="box"]',
-  w:'[data-mode="delete"]',g:'[data-mode="pan"]',q:'#undo',s:'#save',
+  w:'[data-mode="delete"]',g:'[data-mode="pan"]',q:'#undo',s:'#save',l:'#savedInfo',
   '0':'#reset',',':'#displayOptions > summary'
 };
 for(const [key,selector] of Object.entries(shortcutControls)){

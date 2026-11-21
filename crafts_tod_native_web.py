@@ -28,6 +28,7 @@ import tornado.ioloop
 import tornado.web
 
 from crafts_tod_mask import (
+    _read_axes,
     AutoMaskDirectories,
     BeamAveragedTod,
     MaskDocument,
@@ -47,7 +48,7 @@ from crafts_tod_mask import (
 )
 
 
-APP_VERSION = "manual-rfi-web-1.1.0"
+APP_VERSION = "manual-rfi-web-1.1.1"
 DEFAULT_INPUT_DIR = Path(
     "/data71/common_storage/zhouyunfan/test_codex20260722/oldpipeline/test_all/"
     "gzn_20260831/five_stripes_current_modules_0001_0010_v2/server_data/"
@@ -299,6 +300,7 @@ class NativeMaskState:
                 "version": APP_VERSION, "save_dir": str(self.args.mask_dir),
                 "save_root": str(self.save_root), "default_dir": str(self.default_dir),
                 "save_file": str(mask_path(self.args.mask_dir, group)), "last_saved": self.last_saved,
+                "warnings": list(self.aggregate.warnings) if self.aggregate else [],
                 "phase": self.phase,
                 "busy": self.busy,
                 "message": self.message,
@@ -359,11 +361,14 @@ class NativeMaskState:
                     block_records=self.args.block_records,
                     progress=lambda message: self._log(message, "loading", True),
                     require_all_masks=self.args.require_all_auto_masks,
+                    allow_short_tail=True,
                 ),
             )
+            native_record_counts = {item.beam: len(_read_axes(item.path)[1]) for item in self.group.files}
             with self.lock:
                 if token != self.load_token:
                     return
+                self.native_record_counts = native_record_counts
                 self.aggregate = aggregate
                 self.frequency = aggregate.frequency_mhz
                 self.mjd = aggregate.mjd
@@ -376,6 +381,8 @@ class NativeMaskState:
                     self.local_medians.append(median)
                     aggregate.raw_mean[:, :, pol] -= median
                     aggregate.auto_masked_mean[:, :, pol] -= median
+                for warning in aggregate.warnings:
+                    self._log(warning)
                 self.undo_stack.clear()
                 self.dirty = False
                 self.revision += 1
@@ -427,6 +434,7 @@ class NativeMaskState:
                 AutoMaskDirectories(self.args.one_channel_dir, self.args.sat1380_dir),
                 block_records=self.args.block_records,
                 require_all_masks=self.args.require_all_auto_masks,
+                reference_mjd=reference_mjd,
             )
             if not np.allclose(single.frequency_mhz, reference_frequency, rtol=0.0, atol=1.0e-7):
                 raise ValueError(f"Frequency axis mismatch for {beam}")
@@ -634,7 +642,7 @@ class NativeMaskState:
         def write() -> list[Path]:
             save_mask_document(json_target, document)
             self.disk_signature = self.signature(json_target)
-            return save_beam_mask_products(self.args.mask_dir, group=group, frequency_mhz=frequency, mjd=mjd, document=document, json_path=json_target)
+            return save_beam_mask_products(self.args.mask_dir, group=group, frequency_mhz=frequency, mjd=mjd, document=document, json_path=json_target, native_record_counts=getattr(self, "native_record_counts", None))
 
         try:
             paths = await asyncio.get_running_loop().run_in_executor(self.executor, write)
