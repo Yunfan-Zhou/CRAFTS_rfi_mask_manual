@@ -176,6 +176,17 @@ python -m pytest -q test_crafts_tod_mask.py
 
 ## Update Log
 
+### 2026-11-21 — Native web UI 1.8.1
+
+- Press `M` to toggle manual mask overlays and `V` to toggle automatic overlays.
+- Select an nfile directly and assign quality grades per beam. The save dialog lists
+  the grades before writing them to the group JSON and individual beam NPZ files.
+  A green indicator shows when the current file has loaded saved annotations.
+- Drag either spectrum to zoom along its axis, or Shift-drag to mark a range.
+  Shift-wheel zooms frequency on the bottom spectrum. Arrow keys move a hovered
+  guide and pan the linked plots at the viewport edge. The time profiles also
+  show elapsed seconds derived from record timestamps.
+
 ### 2026-09-16 — Web viewport navigation and beam comparison
 
 - Pointer-anchored zoom on the waterfalls and spectrum: `Option/Alt + wheel`

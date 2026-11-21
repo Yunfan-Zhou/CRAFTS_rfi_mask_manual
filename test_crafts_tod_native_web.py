@@ -157,7 +157,8 @@ def test_ui_clears_every_loading_cover():
 def test_ui_has_synchronized_frequency_reference_cursor():
     html = Path(__file__).with_name("crafts_tod_native_ui.html").read_text()
     assert "referenceFrequency" in html
-    assert "$('#spectrum').addEventListener('click'" in html
+    release_handler = html.split("spectrumCanvas.addEventListener('pointerup'", 1)[1].split("spectrumCanvas.addEventListener", 1)[0]
+    assert "selectGuideChannel(channelAt(end.f))" in release_handler
     assert "drawReference(ctx,p,true)" in html
 
 
@@ -178,7 +179,7 @@ def test_spectrum_and_waterfalls_share_frequency_plot_bounds():
     html = Path(__file__).with_name("crafts_tod_native_ui.html").read_text()
     bounds = "w:w-(PAD.l+rightPadding(c))*dpr"
     assert bounds in html.split("function plotRect(c)", 1)[1].split("function dataAt", 1)[0]
-    assert bounds in html.split("function drawSpectrum(data)", 1)[1].split("const single=", 1)[0]
+    assert "p=plotRect(c)" in html.split("function drawSpectrum(data)", 1)[1].split("const single=", 1)[0]
     assert "w-77*dpr" not in html
     assert "c.width-77*dpr" not in html
 

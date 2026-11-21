@@ -86,6 +86,8 @@ class MaskDocument:
     time_unit: str = "record"
     interval_convention: str = "frequency closed; record intervals half-open [start, stop)"
 
+    beam_quality_labels: dict[str, int] = field(default_factory=dict)
+
     @classmethod
     def empty(cls, group: TodGroup) -> "MaskDocument":
         return cls(
@@ -252,7 +254,17 @@ def _normalize_polarizations(
     return polarizations
 
 
+def validate_quality_label(label: int) -> int:
+    if type(label) is not int or label not in (0, 1, 2):
+        raise ValueError("文件质量标签必须是 0、1、2")
+    return label
+
+
 def normalize_document(document: MaskDocument) -> MaskDocument:
+    for beam, label in document.beam_quality_labels.items():
+        if beam not in EXPECTED_BEAMS:
+            raise ValueError(f"Unsupported beam quality label: {beam!r}")
+        validate_quality_label(label)
     document.polarizations = _normalize_polarizations(document.polarizations)
     normalized_beams: dict[str, list[PolarizationMask]] = {}
     for beam in sorted(set(document.beam_files) | set(document.beam_polarizations)):
@@ -826,6 +838,7 @@ def mask_document_region_summary(document: MaskDocument) -> dict[str, object]:
     normalized = normalize_document(document)
     beams = sorted(set(normalized.beam_files) | set(normalized.beam_polarizations))
     return {
+        "beam_quality_labels": dict(normalized.beam_quality_labels),
         "mean": _region_counts(normalized.polarizations),
         "beams": {
             beam: _region_counts(
@@ -898,6 +911,7 @@ def save_beam_mask_products(
                 scan_name=np.asarray(group.scan_name),
                 window=np.asarray(group.window),
                 nfile=np.asarray(group.serial),
+                quality_label=np.asarray(document.beam_quality_labels.get(item.beam, 0), dtype=np.uint8),
                 reviewed_clean=np.asarray(flagged_count == 0),
                 manual_sample_count=np.asarray(flagged_count, dtype=np.int64),
                 manual_global_sample_count=np.asarray(
