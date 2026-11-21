@@ -45,10 +45,11 @@ from crafts_tod_mask import (
     normalize_document,
     save_beam_mask_products,
     save_mask_document,
+    validate_quality_label,
 )
 
 
-APP_VERSION = "manual-rfi-web-1.1.1"
+APP_VERSION = "manual-rfi-web-1.2.1"
 DEFAULT_INPUT_DIR = Path(
     "/data71/common_storage/zhouyunfan/test_codex20260722/oldpipeline/test_all/"
     "gzn_20260831/five_stripes_current_modules_0001_0010_v2/server_data/"
@@ -222,6 +223,7 @@ class NativeMaskState:
         self.default_dir.relative_to(self.save_root)
         args.mask_dir = self.default_dir
         self.disk_signature = None
+        self.saved_annotations_loaded = False
         self.last_saved = ""
         self.profiles = {}
         self.args = args
@@ -306,6 +308,7 @@ class NativeMaskState:
                 "message": self.message,
                 "ready": ready,
                 "dirty": self.dirty,
+                "saved_annotations_loaded": self.saved_annotations_loaded,
                 "revision": self.revision,
                 "spectrum_revision": self.spectrum_revision,
                 "index": self.index,
@@ -332,6 +335,7 @@ class NativeMaskState:
                 raise ValueError("Unsaved edits: save or revert before changing nfile")
             if index is not None:
                 self.index = index % len(self.groups)
+            self.saved_annotations_loaded = False
             self.load_token += 1
             token = self.load_token
             self.aggregate = None
@@ -538,6 +542,22 @@ class NativeMaskState:
             self._log(f"Manual {mode} edit added to {scope_label} ({'both pols' if len(targets) == 2 else f'pol {pol}'})", "ready", False)
         self.schedule_spectrum()
 
+    def set_quality_label(self, group_key: str, beam: str, label: int) -> None:
+        label = validate_quality_label(label)
+        with self.lock:
+            if self.aggregate is None or group_key != self.group.key:
+                raise ValueError("当前 nfile 已改变或尚未就绪")
+            if beam not in self.group.beams or (self.view_mode == "single" and self.selected_beam != beam):
+                raise ValueError("请选择当前 nfile 中的目标 beam")
+            if self.document.beam_quality_labels.get(beam, 0) == label:
+                return
+            self._push_undo()
+            self.document.beam_quality_labels[beam] = label
+            self.document.done = False
+            self.dirty = True
+            self.revision += 1
+            self._log(f"{self.group.serial} / {beam} 文件质量标签改为 {label}（待保存）")
+
     def save_summary(self) -> dict[str, object]:
         with self.lock:
             return mask_document_region_summary(copy.deepcopy(self.document))
@@ -573,6 +593,7 @@ class NativeMaskState:
             raise ValueError("只有 NPZ，没有记录 Mean/beam 区域的原始 JSON；请选择完整目录以免覆盖")
         doc = load_mask_document(path, self.group)
         self.disk_signature = self.signature(path)
+        self.saved_annotations_loaded = self.disk_signature is not None
         return doc
 
     def choose_directory(self, value):
@@ -595,6 +616,7 @@ class NativeMaskState:
             if any(p.exists() for p in beams):
                 raise ValueError("目标仅有 NPZ，不能覆盖；请选择含标注 JSON 的目录")
             self.disk_signature = None
+            self.saved_annotations_loaded = False
             self.dirty = True
         self.args.mask_dir = dest
         self.last_saved = ""
@@ -780,6 +802,14 @@ class NativeMaskState:
                 restored = values[:, pol] + offsets[pol]
                 return [float(value) if np.isfinite(value) else None for value in restored]
 
+            times = getattr(self, "mjd", np.empty(0))
+            if view_mode == "single":
+                if self.single is None or self.single.beam != requested_beam:
+                    times = np.empty(0)
+                else:
+                    count = getattr(self, "native_record_counts", {}).get(requested_beam, len(times))
+                    times = getattr(self.single, "mjd", times)[:count]
+            seconds = (times - times[0]) * 86400.0 if len(times) else times
             payload = {
                 "revision": self.spectrum_revision,
                 "content_revision": getattr(self, "spectrum_content_revision", 0),
@@ -790,6 +820,7 @@ class NativeMaskState:
                 # Keep every channel: viewport-only zoom is performed locally
                 # and must not permanently omit narrow RFI or NaN gaps.
                 "frequency": self.frequency.tolist(),
+                "elapsed_seconds": [float(v) if np.isfinite(v) else None for v in seconds],
                 "pol0": serialized_pol(selected, medians, 0),
                 "pol1": serialized_pol(selected, medians, 1),
             }
@@ -927,6 +958,8 @@ class ActionHandler(BaseHandler):
             result: dict[str, Any] = {}
             if action == "edit":
                 self.state.edit(payload)
+            elif action == "quality_label":
+                self.state.set_quality_label(payload["group"], payload["beam"], payload["label"])
             elif action == "directory":
                 self.state.choose_directory(payload["path"])
             elif action == "saved_info":

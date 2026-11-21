@@ -446,6 +446,7 @@ def test_short_beam_tail_uses_available_samples_and_exports_native_grid(tmp_path
     assert np.isnan(single.raw[2:]).all()
 
     document = MaskDocument.empty(group)
+    document.beam_quality_labels = {"M17": 2}
     document.polarizations[0].time_ranges_records = [[1, 4]]
     json_path = tmp_path / "manual.json"
     save_mask_document(json_path, document)
@@ -457,6 +458,7 @@ def test_short_beam_tail_uses_available_samples_and_exports_native_grid(tmp_path
     for item, path in zip(group.files, paths):
         records = counts[item.beam]
         with np.load(path) as product:
+            assert int(product["quality_label"]) == (2 if item.beam == "M17" else 0)
             assert product["mask"].shape == (records, len(frequency), 2)
             np.testing.assert_array_equal(product["mjd"], mjd[:records])
             np.testing.assert_array_equal(product["freq"], frequency)
