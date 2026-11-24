@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="application-version" content="manual-rfi-ui-1.9.0">
+<meta name="application-version" content="manual-rfi-ui-1.11.0">
 <title>CRAFTS Manual RFI Mask</title>
 <style>
 :root {
@@ -326,11 +326,17 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
       <div class="toolbar-row toolbar-secondary">
         <div class="control-group edit-controls" aria-label="标记工具">
           <span class="group-label">标记</span>
+          <button data-mode="inspect" title="单击选 record，Shift + 单击选连续区间，拖选查看平均谱">查看</button>
           <button data-mode="frequency" class="active">频率</button>
           <button data-mode="time">时间</button>
           <button data-mode="box">矩形</button>
           <button data-mode="delete">删除</button>
           <button data-mode="pan">平移</button>
+        </div>
+        <div class="control-group" aria-label="频谱抽取">
+          <button id="clearExtract" hidden>清除选区</button>
+          <label class="check" id="overlayControl" hidden><input type="checkbox" id="overlayAll">叠加全部均值</label>
+          <button id="extractBand" hidden>查看全频段</button>
         </div>
         <div class="control-group quality-controls" aria-label="文件质量标记">
           <label class="group-label" for="qualityBeam">文件质量</label> <select id="qualityBeam" aria-label="评级 beam"></select>
@@ -424,7 +430,7 @@ body.sidebar-collapsed #toggleSidebar { border-color: #425d76; color: #bcd9ed; }
         </div>
       </div>
       <div class="spectrum">
-        <canvas id="spectrum" aria-label="双偏振平均频谱" title="单击定位频率，左右拖选放大频段，Shift + 滚轮缩放频率，Shift + 拖选标记频段" tabindex="0"></canvas>
+        <canvas id="spectrum" aria-label="双偏振频谱" title="单击定位频率，左右拖选放大频段，Shift + 滚轮缩放频率，Shift + 拖选标记频段" tabindex="0"></canvas>
         <div id="spectrumLegend" class="spectrum-legend" aria-label="频谱偏振图例">
           <span class="legend-item legend-pol0"><span class="legend-line"></span>Pol 0</span>
           <span class="legend-item legend-pol1"><span class="legend-line"></span>Pol 1</span>
@@ -522,6 +528,7 @@ function wheelScale(event,height){
   return Math.exp(Math.max(-180,Math.min(180,delta))*.002);
 }
 function gestureKind(event,mode){
+  if(mode==='inspect')return mode;
   if(event.altKey&&event.shiftKey)return'zoom-both';
   if(event.altKey)return'zoom-frequency';
   if(event.shiftKey)return'zoom-time';
@@ -573,13 +580,18 @@ function drawManual(c,ctx,p,pol){
     for(const[a,b]of m.time_ranges_records){const q0=xy(c,app.view.f0,a),q1=xy(c,app.view.f1,b);ctx.fillRect(p.x,q1.y,p.w,q0.y-q1.y)}
     for(const box of m.boxes){const[a,b]=box.frequency_mhz,[u,v]=box.records,q0=xy(c,a,u),q1=xy(c,b,v);ctx.fillRect(q0.x,q1.y,q1.x-q0.x,q0.y-q1.y);ctx.strokeRect(q0.x,q1.y,q1.x-q0.x,q0.y-q1.y)}
   }
+  if(extraction.source==='region'&&extraction.region){
+    const r=extraction.region,origin=app.state.frequency_range[0],step=channelStep();
+    const a=xy(c,origin+(r.left-.5)*step,r.stop),b=xy(c,origin+(r.right-.5)*step,r.first);
+    ctx.strokeStyle='#57c7ff';ctx.setLineDash([5*p.dpr,4*p.dpr]);ctx.strokeRect(a.x,a.y,b.x-a.x,b.y-a.y);ctx.setLineDash([]);
+  }
   if(app.drag&&app.drag.kind!=='spectrum-range'&&app.drag.pol===pol&&app.drag.now){
     const a=app.drag.start,b=app.drag.now,kind=app.drag.kind;
     let x=Math.min(a.x,b.x),y=Math.min(a.y,b.y),w=Math.abs(a.x-b.x),h=Math.abs(a.y-b.y);
     if(kind==='zoom-frequency'){y=p.y;h=p.h}
     if(kind==='zoom-time'){x=p.x;w=p.w}
     if(kind!=='pan'){
-      ctx.fillStyle=kind.startsWith('zoom-')?'#57c7ff33':'#ffffff22';ctx.strokeStyle=kind.startsWith('zoom-')?'#57c7ff':'#fff';ctx.setLineDash([5*p.dpr,4*p.dpr]);
+      ctx.fillStyle=kind==='inspect'||kind.startsWith('zoom-')?'#57c7ff33':'#ffffff22';ctx.strokeStyle=kind==='inspect'||kind.startsWith('zoom-')?'#57c7ff':'#fff';ctx.setLineDash([5*p.dpr,4*p.dpr]);
       ctx.fillRect(x,y,w,h);ctx.strokeRect(x,y,w,h);
     }
   }
@@ -664,6 +676,11 @@ function drawTimeProfile(ctx,p,pol){
     ctx.save();ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();ctx.beginPath();let line=false;
     for(let i=first;i<end;i++){const v=values[i];if(!Number.isFinite(v)){line=false;continue}const xx=x+w*(v-lo)/(hi-lo),yy=recordY(p,i+.5);if(line)ctx.lineTo(xx,yy);else {ctx.moveTo(xx,yy);ctx.lineTo(xx+.01*k,yy)}line=true}
     ctx.lineCap='round';ctx.strokeStyle=pol?'#ffa865':'#75d9f3';ctx.stroke();ctx.restore();
+  }
+  if(extraction.source==='region'&&extraction.region.anchor!=null){
+    const top=Math.max(y,recordY(p,extraction.region.stop));
+    const bottom=Math.min(y+h,recordY(p,extraction.region.first));
+    ctx.fillStyle='#57c7ff33';ctx.fillRect(x,top,w,Math.max(0,bottom-top));
   }
   const drag=app.profileDrag;
   if(drag&&drag.pol===pol){const a=recordY(p,drag.start.t),b=recordY(p,drag.now.t);ctx.fillStyle=drag.mark?'#ff3d6670':'#57c7ff33';ctx.fillRect(x,Math.min(a,b),w,Math.abs(a-b))}
@@ -763,6 +780,80 @@ function spectrumPoints(frequency,values,view,bins){
   }
   flush();return points;
 }
+// Selection is tab-local. Coalesce held arrow keys into the latest request.
+const extraction={source:'all',region:null,key:null,result:null,timer:null,running:false,error:false};
+function extractionParams(){
+  const s=app.state,source=extraction.source;
+  if(source==='all'||!s?.ready||s.busy||app.scopePending)return null;
+  const selection=source==='record'&&app.referenceRecord!==null?
+    {first:app.referenceRecord,stop:app.referenceRecord+1,left:0,right:s.shape[1]}:
+    source==='region'?extraction.region:null;
+  return selection&&new URLSearchParams({first:selection.first,stop:selection.stop,left:selection.left,right:selection.right,group:s.group.key,view_mode:s.view_mode,
+    beam:s.selected_beam,apply_auto:+$('#applyAuto').checked,revision:s.spectrum_revision});
+}
+function refreshExtraction(){
+  const params=extractionParams(),key=params?.toString()||null;
+  if(key===extraction.key)return;
+  clearTimeout(extraction.timer);
+  extraction.key=key;extraction.result=null;extraction.error=false;
+  requestLocalDraw();
+  if(key&&!extraction.running)extraction.timer=setTimeout(fetchExtraction,80);
+}
+async function fetchExtraction(){
+  const key=extraction.key;
+  if(!key||extraction.running)return;
+  extraction.running=true;
+  try{
+    const response=await fetch('/api/extract?'+key);
+    if(!response.ok)throw Error(response.statusText);
+    const result=await response.json();
+    if(key===extraction.key)extraction.result=result;
+  }catch{
+    if(key===extraction.key){extraction.error=true;
+      extraction.timer=setTimeout(()=>{if(key===extraction.key){extraction.key=null;refreshExtraction()}},2500)}
+  }finally{
+    extraction.running=false;requestLocalDraw();
+    if(key!==extraction.key&&extraction.key)extraction.timer=setTimeout(fetchExtraction,80);
+  }
+}
+function selectSource(source){
+  extraction.source=source;
+  $('#overlayControl').hidden=source==='all';
+  $('#extractBand').hidden=source!=='region'||!extraction.region;
+  $('#clearExtract').hidden=source==='all';
+  refreshExtraction();requestLocalDraw();
+}
+$('#clearExtract').onclick=()=>{extraction.region=null;app.referenceRecord=null;selectSource('all')};
+$('#overlayAll').onchange=()=>requestLocalDraw();
+function inspectRange(t0,t1,f0,f1,anchor=null){
+  const first=recordAt(Math.min(t0,t1));
+  const stop=Math.max(first+1,Math.min(app.state.shape[0],Math.ceil(Math.max(t0,t1))));
+  const channel=f=>Math.max(0,Math.min(app.state.shape[1]-1,channelAt(f)));
+  const left=channel(Math.min(f0,f1)),right=channel(Math.max(f0,f1))+1;
+  extraction.region={first,stop,left,right,boxLeft:left,boxRight:right,anchor};
+  $('#extractBand').textContent='查看全频段';selectSource('region');
+  $('#extractBand').hidden=left===0&&right===app.state.shape[1];
+}
+function inspectRecord(t,extend){
+  const row=recordAt(t);
+  const anchor=extraction.source==='record'?app.referenceRecord:
+    extraction.source==='region'?extraction.region?.anchor:null;
+  app.referenceRecord=row;
+  if(extend&&anchor!=null){
+    // Records are inclusive in the UI; extraction uses an exclusive stop.
+    inspectRange(Math.min(anchor,row),Math.max(anchor,row)+1,...app.state.frequency_range,anchor);
+  }else{
+    selectSource('record');
+  }
+}
+$('#extractBand').onclick=()=>{
+  const r=extraction.region;
+  if(!r)return;
+  const full=r.left!==0||r.right!==app.state.shape[1];
+  [r.left,r.right]=full?[0,app.state.shape[1]]:[r.boxLeft,r.boxRight];
+  $('#extractBand').textContent=full?'返回选区频段':'查看全频段';
+  refreshExtraction();requestLocalDraw();
+};
 function drawSpectrum(data){
   app.spectrumData=data;
   const c=$('#spectrum'),{ctx,w,h,dpr}=fitCanvas(c),p=plotRect(c);
@@ -775,9 +866,31 @@ function drawSpectrum(data){
   const single=$('#viewMode').value==='single';
   const matchingGroup=data.group_key===app.state.group.key;
   const cachedMean=app.meanSpectrum?.group_key===app.state.group.key?app.meanSpectrum:null;
-  const reference=single?(matchingGroup&&data.mean_pol0?.length?{frequency:data.frequency,pol0:data.mean_pol0,pol1:data.mean_pol1}:cachedMean):null;
-  const active=matchingGroup&&(single?data.view_mode==='single'&&data.view_label===$('#beamSelect').value:data.view_mode==='mean')?data:null;
-  const scope=JSON.stringify([app.state.group.key,single?$('#beamSelect').value:'mean']);
+  let reference=single?(matchingGroup&&data.mean_pol0?.length?{frequency:data.frequency,pol0:data.mean_pol0,pol1:data.mean_pol1}:cachedMean):null;
+  let active=matchingGroup&&(single?data.view_mode==='single'&&data.view_label===$('#beamSelect').value:data.view_mode==='mean')?data:null;
+  const source=extraction.source, region=extraction.region, subset=source!=='all';
+  let title='全部 record', left=0;
+  if(subset){
+    reference=$('#overlayAll').checked?active:null;
+    left=source==='region'&&region?region.left:0;
+    title=source==='record'?'Record '+(app.referenceRecord??'—'):region?
+      `Record ${region.first}–${region.stop-1}（${region.stop-region.first} 条）· 选区平均`:'选区平均';
+    active=active&&active.revision===app.state.spectrum_revision&&extraction.result?
+      {...extraction.result,frequency:data.frequency.slice(left,left+extraction.result.pol0.length),selected_ready:true}:null;
+  }
+  const scope=JSON.stringify([app.state.group.key,single?$('#beamSelect').value:'mean',source,
+    extraction.key,!!extraction.result,$('#overlayAll').checked]);
+  const legend=$('#spectrumLegend');
+  legend.innerHTML=(reference?(subset?'<span>淡虚线 · 全部 record</span>':'<span>淡虚线 · 19-beam Mean</span>'):'')+
+    '<span class="legend-pol0">Pol 0</span><span class="legend-pol1">Pol 1</span>';
+  ctx.font=`${10*dpr}px system-ui`;ctx.textAlign='left';ctx.textBaseline='alphabetic';ctx.fillStyle='#91a3b7';
+  ctx.fillText(`${single?$('#beamSelect').value:'19-beam Mean'} · ${title} · ${data.apply_auto?'自动+手动':'手动'} · ${SPECTRUM_Y_LABELS[app.spectrumYMode]}`,p.x+4,14*dpr);
+  if(subset&&!active){
+    drawSpectrumAxis(ctx,p,h);
+    const hint=extraction.error?'抽谱失败，正在重试':!extraction.key?
+      (source==='record'?'单击瀑布图或全频带均值图以选择 record':'在瀑布图拖框选择 record 和频段'):'正在抽取谱线…';
+    ctx.textAlign='left';ctx.fillText(hint,p.x+8*dpr,p.y+18*dpr);app.spectrumDrawCache=null;return;
+  }
   const series=[];
   if(reference?.frequency?.length){series.push({f:reference.frequency,v:reference.pol0,color:'#57c7ff',reference:true},{f:reference.frequency,v:reference.pol1,color:'#ffb15b',reference:true})}
   if(active?.frequency?.length){series.push({f:active.frequency,v:active.pol0,color:'#57c7ff',reference:false},{f:active.frequency,v:active.pol1,color:'#ffb15b',reference:false})}
@@ -789,7 +902,7 @@ function drawSpectrum(data){
     for(const line of series)for(let i=0;i<line.f.length;i++){if(line.f[i]>=app.view.f0&&line.f[i]<=app.view.f1&&Number.isFinite(line.v?.[i]))values.push(line.v[i])}
     if(!values.length){app.spectrumDrawCache=null;drawSpectrumAxis(ctx,p,h);ctx.fillStyle='#91a3b7';ctx.textAlign='left';ctx.fillText((active?.selected_ready||reference&&data.mean_ready)?'当前范围无有效谱线样本':'频谱计算中…',p.x+10,p.y+20);return}
     values.sort((a,b)=>a-b);
-    prepared={data,reference:app.meanSpectrum,scope,single,f0:app.view.f0,f1:app.view.f1,bins,mode:app.spectrumYMode,limits:spectrumYLimits(values,app.spectrumYMode),series:series.map(line=>({...line,points:spectrumPoints(line.f,line.v,app.view,bins)}))};
+    prepared={data,active,left,reference:app.meanSpectrum,scope,single,f0:app.view.f0,f1:app.view.f1,bins,mode:app.spectrumYMode,limits:spectrumYLimits(values,app.spectrumYMode),series:series.map(line=>({...line,points:spectrumPoints(line.f,line.v,app.view,bins)}))};
     app.spectrumDrawCache=prepared;
   }
   const[lo,hi]=prepared.limits;drawSpectrumAxis(ctx,p,h,lo,hi);
@@ -801,16 +914,12 @@ function drawSpectrum(data){
       if(point===null){started=false;continue}
       const[f,v]=point;
       const x=p.x+(f-app.view.f0)/(app.view.f1-app.view.f0)*p.w,y=p.y+(hi-v)/(hi-lo)*p.h;
-      if(!started){ctx.moveTo(x,y);started=true}else ctx.lineTo(x,y);
+      if(!started){ctx.moveTo(x-.5*dpr,y);ctx.lineTo(x,y);started=true}else ctx.lineTo(x,y);
     }
     ctx.stroke();
   }
   ctx.restore();drawReference(ctx,p,true);
-  ctx.font=`${10*dpr}px system-ui`;ctx.textAlign='left';ctx.textBaseline='alphabetic';ctx.fillStyle='#91a3b7';
-  ctx.fillText(`${single?$('#beamSelect').value:'19-beam Mean'} · ${data.apply_auto?'自动+手动':'手动'} · ${SPECTRUM_Y_LABELS[app.spectrumYMode]}`,p.x+4,14*dpr);
-  const legend=$('#spectrumLegend');
-  legend.innerHTML=single?'<span>实线：当前 beam · 淡虚线：19-beam Mean</span><span class="legend-pol0">Pol 0</span><span class="legend-pol1">Pol 1</span>':'<span class="legend-pol0">Pol 0</span><span class="legend-pol1">Pol 1</span>';
-  legend.title=single?'参考 Mean 只应用公共手动层；当前 beam 应用公共层与其专属层。':'';
+
 }
 async function pollSpectrum(force=false){
   if(!app.state?.ready||app.scopePending)return;
@@ -899,7 +1008,7 @@ function applyState(s,initial=false){
     const canvas=$('#spectrum');canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
   }
   if(newScope||!s.ready||s.busy){
-    if(app.drag?.kind==='spectrum-range')app.drag=null;
+    app.drag=null;
     app.profileDrag=null;
   }
   app.state=s;
@@ -941,10 +1050,11 @@ function applyState(s,initial=false){
   $('#lastSaved').textContent=s.last_saved?'保存成功：'+s.last_saved:'';
   if(!prior||prior.save_dir!==s.save_dir)$('#dirInput').value=s.save_dir;
   $('#viewBack').disabled=s.busy||!app.history.length;
-  if(newGroup){invalidateImages();app.meanSpectrum=null;app.spectrumData=null;app.spectrumKey=null;app.history=[];app.referenceFrequency=null;app.referenceRecord=null;app.profileDrag=null;app.view=null;hoveredGuide=null}
+  if(newGroup){extraction.region=null;selectSource('all');invalidateImages();app.meanSpectrum=null;app.spectrumData=null;app.spectrumKey=null;app.history=[];app.referenceFrequency=null;app.referenceRecord=null;app.profileDrag=null;app.view=null;hoveredGuide=null}
   else if(newScope){invalidateImages();app.spectrumKey=null}
   if(s.ready&&(!app.view||initial))app.view={f0:s.frequency_range[0],f1:s.frequency_range[1],t0:0,t1:s.shape[0]};
   if(s.ready&&(newScope||!prior?.ready||initial))renderAll();
+  refreshExtraction();
   if(s.ready){requestLocalDraw();pollSpectrum();updateViewStatus()}
 }
 async function poll(){
@@ -960,8 +1070,13 @@ async function action(payload,{apply=true,navigation=false}={}){
   }catch(error){toast(error.message,true);throw error}
 }
 function setMode(mode){
+  if(app.mode!==mode){app.drag=null;app.profileDrag=null}
+  if(mode!=='inspect'&&extraction.source!=='all')selectSource('all');
+  const inspect=mode==='inspect';
+  $('.gesture-hint').hidden=inspect;
+  $('#spectrum').title=inspect?'横拖选择频段，滚轮缩放频率':'单击定位频率，左右拖选放大频段，Shift + 滚轮缩放频率，Shift + 拖选标记频段';
   app.mode=mode;document.querySelectorAll('[data-mode]').forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));
-  const labels={frequency:'频率标记',time:'时间标记',box:'矩形标记',delete:'删除标记',pan:'平移', 'zoom-frequency':'拖选频率放大（不修改 mask）','zoom-time':'拖选时间放大（不修改 mask）'};
+  const labels={frequency:'频率标记',time:'时间标记',box:'矩形标记',delete:'删除标记',pan:'平移',inspect:'查看 · 单击选起点，Shift + 单击选终点，拖选抽谱；滚轮缩放频率，时间谱滚轮或瀑布图 Shift + 滚轮缩放 record', 'zoom-frequency':'拖选频率放大（不修改 mask）','zoom-time':'拖选时间放大（不修改 mask）'};
   $('#modeHint').textContent=`当前模式：${labels[mode]||mode}`;
 }
 document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{setMode(b.dataset.mode);$('#displayOptions').open=false});
@@ -1062,7 +1177,7 @@ $('#applyManualMean').onchange=async e=>{
   catch{control.checked=Boolean(app.state.apply_manual_mean)}
   finally{control.disabled=app.state.view_mode!=='mean'||app.state.busy}
 };
-$('#applyAuto').onchange=()=>{app.spectrumKey=null;app.meanSpectrum=null;app.spectrumData=null;renderAll();pollSpectrum(true)};
+$('#applyAuto').onchange=()=>{refreshExtraction();app.spectrumKey=null;app.meanSpectrum=null;app.spectrumData=null;renderAll();pollSpectrum(true)};
 $('#showAuto').onchange=()=>renderAll();
 $('#showManual').onchange=requestLocalDraw;
 function updateColorDrag(c,event,pol){
@@ -1075,7 +1190,7 @@ function updateColorDrag(c,event,pol){
   app.imageQuality[pol]='preview';drawPanel(pol);return true;
 }
 function handleWheel(c,event,axis=event.shiftKey?'time':'frequency'){
-  if(!app.state?.ready||app.scopePending||app.state.busy||app.drag||(!event.altKey&&!event.shiftKey))return;
+  if(!app.state?.ready||app.scopePending||app.state.busy||app.drag||(app.mode!=='inspect'&&!event.altKey&&!event.shiftKey))return;
   const d=dataAt(c,event);if(!d.inside)return;event.preventDefault();
   if(!app.wheelActive){rememberView();app.wheelActive=true}
   const anchor=axis==='time'?d.t:d.f;
@@ -1088,15 +1203,15 @@ canvases.forEach((c,pol)=>{
     if(profileAt(c,d)){
       if(app.profileDrag||app.drag)return;
       e.preventDefault();c.focus({preventScroll:true});c.setPointerCapture(e.pointerId);
-      app.profileDrag={pol,id:e.pointerId,start:d,now:d,mark:e.shiftKey,both:$('#both').checked};
-      if(e.shiftKey)$('#coord').textContent=markLabel(app.profileDrag)+'拖选 record';
+      app.profileDrag={pol,id:e.pointerId,start:d,now:d,extend:app.mode==='inspect'&&e.shiftKey,mark:app.mode!=='inspect'&&e.shiftKey,both:$('#both').checked};
+      if(app.profileDrag.mark)$('#coord').textContent=markLabel(app.profileDrag)+'拖选 record';
       return;
     }
     if(!e.altKey&&!e.shiftKey){const hit=colorbarHit(c,e,pol);if(hit){c.setPointerCapture(e.pointerId);app.colorRanges[pol]=[...(app.colorRanges[pol]||app.limits[pol])];app.colorDrag={pol,handle:hit.handle,base:hit.base};updateColorDrag(c,e,pol);return}}
     if(!d.inside)return;
-    if(!kind.startsWith('zoom-')&&kind!=='pan'&&!viewIsClear()){toast('正在更新清晰视图，请稍候再标记。');return}
+    if(!kind.startsWith('zoom-')&&!['pan','inspect'].includes(kind)&&!viewIsClear()){toast('正在更新清晰视图，请稍候再标记。');return}
     e.preventDefault();c.focus({preventScroll:true});c.setPointerCapture(e.pointerId);
-    app.drag={pol,pointerId:e.pointerId,kind,start:d,now:d,base:{...app.view},remembered:false};
+    app.drag={pol,pointerId:e.pointerId,kind,extend:kind==='inspect'&&e.shiftKey,start:d,now:d,base:{...app.view},remembered:false};
   });
   c.addEventListener('pointermove',e=>{
     if(updateColorDrag(c,e,pol))return;
@@ -1128,14 +1243,22 @@ canvases.forEach((c,pol)=>{
     if(pd&&pd.pol===pol&&pd.id===e.pointerId){
       app.profileDrag=null;const d=dataAt(c,e),t=Math.max(app.view.t0,Math.min(app.view.t1,d.t));
       if(Math.abs(d.y-pd.start.y)>3*plotRect(c).dpr){
+        if(app.mode==='inspect'){inspectRange(pd.start.t,t,...app.state.frequency_range);return}
         if(pd.mark){requestLocalDraw();await markSpectrumRange(pd,'time',pd.start.t,t);return}
         rememberView();app.view=rangeZoomView(app.view,'zoom-time',{t:Math.floor(Math.min(t,pd.start.t))},{t:Math.ceil(Math.max(t,pd.start.t))},app.state);navigationChanged(true);
-      }else if(!pd.mark){app.referenceRecord=recordAt(t);$('#coord').textContent=profileReadout(t,pol);requestLocalDraw()}return;
+      }else if(!pd.mark){setMode('inspect');inspectRecord(t,pd.extend);$('#coord').textContent=profileReadout(t,pol);requestLocalDraw()}return;
     }
     if(app.colorDrag?.pol===pol){updateColorDrag(c,e,pol);app.colorDrag=null;renderAll();return}
     if(!app.drag||app.drag.pol!==pol||app.drag.pointerId!==e.pointerId)return;
     const drag=app.drag,d=dataAt(c,e),p=plotRect(c);app.drag=null;
     const dx=Math.abs(d.x-drag.start.x),dy=Math.abs(d.y-drag.start.y),threshold=3*p.dpr;
+    if(drag.kind==='inspect'){
+      if(dx<threshold&&dy<threshold){inspectRecord(d.t,drag.extend);return}
+      const v=drag.base, clamp=(value,lo,hi)=>Math.max(lo,Math.min(hi,value));
+      inspectRange(dy<threshold?v.t0:drag.start.t,dy<threshold?v.t1:clamp(d.t,v.t0,v.t1),
+        dx<threshold?v.f0:drag.start.f,dx<threshold?v.f1:clamp(d.f,v.f0,v.f1));
+      return;
+    }
     if(drag.kind==='pan'){navigationChanged(true);return}
     if(drag.kind.startsWith('zoom-')){
       if((drag.kind!=='zoom-time'&&dx<threshold)||(drag.kind!=='zoom-frequency'&&dy<threshold)){requestLocalDraw();return}
@@ -1160,7 +1283,7 @@ function nearestSpectrumPol(point){
   const kelvin=hi-(point.y-p.y)/p.h*(hi-lo);
   let closest=null,distance=Infinity;
   for(const pol of [0,1]){
-    const value=data['pol'+pol]?.[channel];
+    const value=prepared.active?.['pol'+pol]?.[channel-prepared.left];
     if(!Number.isFinite(value)||value<lo||value>hi)continue;
     const delta=Math.abs(kelvin-value);
     if(delta<distance){closest=pol;distance=delta}
@@ -1187,7 +1310,7 @@ spectrumCanvas.addEventListener('pointerdown',e=>{
   if(e.button!==0||app.drag||app.profileDrag||!app.state?.ready||app.state.busy||app.scopePending||!$('#saveConfirm').hidden)return;
   const start=spectrumPoint(e);
   if(!start.inside)return;
-  const mark=e.shiftKey,both=$('#both').checked;
+  const mark=app.mode!=='inspect'&&e.shiftKey,both=$('#both').checked;
   const pol=mark&&!both?nearestSpectrumPol(start):0;
   if(pol===null){toast('请从可见的偏振实线开始拖动，或勾选「双偏振」。');return}
   e.preventDefault();
@@ -1213,6 +1336,12 @@ spectrumCanvas.addEventListener('pointerup',async e=>{
   app.drag=null;
   const end=spectrumPoint(e);
   if(Math.abs(end.x-drag.start.x)>3*plotRect(spectrumCanvas).dpr){
+    if(app.mode==='inspect'){
+      let {t0,t1}=app.view;
+      if(extraction.source==='record'){t0=app.referenceRecord;t1=t0+1}
+      if(extraction.source==='region'){t0=extraction.region.first;t1=extraction.region.stop}
+      inspectRange(t0,t1,drag.start.f,end.f);return;
+    }
     if(drag.mark){requestLocalDraw();await markSpectrumRange(drag,'frequency',drag.start.f,end.f);return}
     rememberView();
     app.view=rangeZoomView(app.view,'zoom-frequency',drag.start,end,app.state);
@@ -1272,7 +1401,8 @@ function followGuide(value,lo,hi){
   navigationChanged(false,true);
 }
 function moveHoveredGuide(key){
-  const guide=hoveredGuide;
+  const guide=hoveredGuide||(app.mode==='inspect'&&extraction.source==='record'&&app.referenceRecord!==null&&canvases.includes(document.activeElement)?
+    {nearRecord:true,pol:canvases.indexOf(document.activeElement)}:null);
   if(!guide)return false;
   if(guide.nearFrequency && (key==='ArrowLeft'||key==='ArrowRight')){
     const next=channelAt(app.referenceFrequency)+(key==='ArrowRight'?1:-1);
@@ -1281,7 +1411,7 @@ function moveHoveredGuide(key){
   }else if(guide.nearRecord && (key==='ArrowUp'||key==='ArrowDown')){
     const next=app.referenceRecord+(key==='ArrowUp'?1:-1);
     if(next>=0&&next<app.state.shape[0]){
-      app.referenceRecord=next;
+      app.referenceRecord=next;refreshExtraction();
       followGuide(next+.5,'t0','t1');
       $('#coord').textContent=profileReadout(next+.5,guide.pol);
     }
@@ -1289,7 +1419,7 @@ function moveHoveredGuide(key){
   requestLocalDraw();
   return true;
 }
-$('#spectrum').addEventListener('wheel',e=>{if(e.shiftKey&&!e.altKey)handleWheel(spectrumCanvas,e,'frequency')},{passive:false});
+$('#spectrum').addEventListener('wheel',e=>{if(app.mode==='inspect'||e.shiftKey&&!e.altKey)handleWheel(spectrumCanvas,e,'frequency')},{passive:false});
 function clampView(){app.view=constrainView(app.view,app.state)}
 function storedPreference(key,fallback){try{const value=localStorage.getItem(key);return value===null?fallback:value}catch{return fallback}}
 function storePreference(key,value){try{localStorage.setItem(key,String(value))}catch{}}
