@@ -50,7 +50,7 @@ from crafts_tod_mask import (
 )
 
 
-APP_VERSION = "manual-rfi-web-1.3.0"
+APP_VERSION = "manual-rfi-web-1.4.0"
 DEFAULT_INPUT_DIR = Path(
     "/data71/common_storage/zhouyunfan/test_codex20260722/oldpipeline/test_all/"
     "gzn_20260831/five_stripes_current_modules_0001_0010_v2/server_data/"
@@ -921,6 +921,43 @@ class NativeMaskState:
                 payload["mean_scope"] = "global_manual_only"
             return payload
 
+    def extract_spectrum(self, params: dict[str, str]) -> dict[str, Any]:
+        """Extract from the same in-memory grid and masks as the full spectrum."""
+        first, stop, left, right = (int(params[k]) for k in ("first", "stop", "left", "right"))
+        auto = bool(int(params["apply_auto"]))
+        with self.lock:
+            if (self.aggregate is None or self.group.key != params["group"]
+                    or self.view_mode != params["view_mode"] or self.busy
+                    or self.spectrum_revision != int(params["revision"])):
+                raise ValueError("视图已更新")
+            if not (0 <= first < stop <= len(self.mjd) and 0 <= left < right <= len(self.frequency)):
+                raise ValueError("选区超出数据范围")
+            beam = None
+            extra = None
+            if self.view_mode == "single":
+                beam = params["beam"]
+                if self.single is None or self.single.beam != beam:
+                    raise ValueError("beam 已切换")
+                grid = self.single.raw
+                offsets = self.single_medians
+                if auto:
+                    extra = self.single.union_mask[first:stop, left:right]
+            else:
+                raw, clean = self.aggregate.raw_mean, self.aggregate.auto_masked_mean
+                if self.apply_manual_mean:
+                    if self.manual_display is None:
+                        raise ValueError("正在更新手动 mask 均值")
+                    raw, clean, _ = self.manual_display
+                grid = clean if auto else raw
+                offsets = self.local_medians
+            frequency = self.frequency[left:right]
+            document = copy.deepcopy(self.document)
+        result = masked_time_average(grid[first:stop, left:right], frequency, document,
+                                     additional_mask=extra, beam=beam, record_offset=first)
+        result += offsets
+        return {f"pol{pol}": [float(v) if np.isfinite(v) else None for v in result[:, pol]]
+                for pol in (0, 1)}
+
     def render(
         self, params: dict[str, Any]
     ) -> tuple[bytes, float, float, float, float]:
@@ -1024,6 +1061,19 @@ class SpectrumHandler(BaseHandler):
         )
 
 
+class ExtractSpectrumHandler(BaseHandler):
+    async def get(self) -> None:
+        params = {k: self.get_argument(k) for k in self.request.arguments}
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                self.state.executor, self.state.extract_spectrum, params)
+        except (KeyError, ValueError) as error:
+            self.write_json({"error": str(error)}, 409)
+            return
+        self.set_header("Cache-Control", "no-store")
+        self.write_json(result)
+
+
 class ViewHandler(BaseHandler):
     async def get(self) -> None:
         try:
@@ -1113,7 +1163,7 @@ def main() -> None:
     args = parse_args()
     state = NativeMaskState(args)
     app = tornado.web.Application(
-        [(r"/", IndexHandler), (r"/api/state", StateHandler), (r"/api/spectrum", SpectrumHandler), (r"/api/view.jpg", ViewHandler), (r"/api/action", ActionHandler)],
+        [(r"/", IndexHandler), (r"/api/state", StateHandler), (r"/api/spectrum", SpectrumHandler), (r"/api/extract", ExtractSpectrumHandler), (r"/api/view.jpg", ViewHandler), (r"/api/action", ActionHandler)],
         mask_state=state,
         ui_html=args.ui_html.read_text(encoding="utf-8"),
         compress_response=True,

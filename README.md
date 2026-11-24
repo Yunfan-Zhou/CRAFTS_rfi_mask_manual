@@ -176,6 +176,15 @@ python -m pytest -q test_crafts_tod_mask.py
 
 ## Update Log
 
+### 2026-11-24 — Native web UI 1.11.0
+
+- Select **查看** to inspect a record or a selection in the existing spectrum panel.
+  Click a record, then Shift-click another to average all records between them,
+  including both endpoints. Further Shift-clicks adjust the end of the range.
+- Drag on a waterfall to select records and channels, on a time profile to select
+  records, or on the spectrum to select a frequency band. Use the wheel to zoom.
+  **叠加全部均值** overlays the all-record spectrum for the current view.
+
 ### 2026-11-21 — Native web UI 1.9.0
 
 - In 19-beam Mean, enable `Mean 应用手动 mask` to exclude each beam’s manual

@@ -737,17 +737,18 @@ def _expand_polarization_mask(
     frequency_mhz: np.ndarray,
     ntime: int,
     pol_mask: PolarizationMask,
+    record_offset: int = 0,
 ) -> np.ndarray:
     mask = np.zeros((ntime, len(frequency_mhz)), dtype=bool)
     for lo, hi in pol_mask.frequency_ranges_mhz:
         mask[:, (frequency_mhz >= lo) & (frequency_mhz <= hi)] = True
     for start, stop in pol_mask.time_ranges_records:
-        mask[max(0, start) : min(ntime, stop), :] = True
+        mask[max(0, start - record_offset) : max(0, stop - record_offset), :] = True
     for box in pol_mask.boxes:
         lo, hi = box["frequency_mhz"]
         start, stop = box["records"]
         freq_selection = (frequency_mhz >= lo) & (frequency_mhz <= hi)
-        mask[max(0, int(start)) : min(ntime, int(stop)), freq_selection] = True
+        mask[max(0, int(start) - record_offset) : max(0, int(stop) - record_offset), freq_selection] = True
     return mask
 
 
@@ -757,19 +758,20 @@ def build_mask(
     document: MaskDocument,
     polarization: int,
     beam: str | None = None,
+    record_offset: int = 0,
 ) -> np.ndarray:
     """Expand the global layer, optionally OR-ing one beam-specific layer."""
     if polarization not in (0, 1):
         raise ValueError("polarization must be 0 or 1")
     mask = _expand_polarization_mask(
-        frequency_mhz, ntime, document.polarizations[polarization]
+        frequency_mhz, ntime, document.polarizations[polarization], record_offset
     )
     if beam is not None:
         beam = str(beam).upper()
         beam_layers = document.beam_polarizations.get(beam)
         if beam_layers is not None:
             mask |= _expand_polarization_mask(
-                frequency_mhz, ntime, beam_layers[polarization]
+                frequency_mhz, ntime, beam_layers[polarization], record_offset
             )
     return mask
 
@@ -800,6 +802,7 @@ def masked_time_average(
     additional_mask: np.ndarray | None = None,
     beam: str | None = None,
     include_profile: bool = False,
+    record_offset: int = 0,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Average unmasked records for each frequency and polarization.
 
@@ -819,7 +822,7 @@ def masked_time_average(
     for polarization in (0, 1):
         values = np.asarray(tod[:, :, polarization])
         mask = build_mask(
-            frequency_mhz, tod.shape[0], document, polarization, beam=beam
+            frequency_mhz, tod.shape[0], document, polarization, beam=beam, record_offset=record_offset
         )
         valid = np.isfinite(values) & ~mask
         if additional_mask is not None:
